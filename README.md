@@ -23,6 +23,7 @@
 - **稳态重试**：支持查询重试次数、指数退避、请求超时配置。
 - **错误分类面板**：自动统计网络/风控/参数/接口等错误类别与最近错误。
 - **智能中转方案**：支持自定义中转站、换乘等待区间、最大方案数，自动给出 1 次中转建议并可一键打开首段/次段下单页。
+- **人工提交辅助**：命中后可自动复制关键信息到剪贴板，展示倒计时指引，并支持一键打开推荐直达/中转下单页。
 - **配置持久化**：退出时自动保存到 `settings.json`。
 
 ## 运行环境
@@ -53,24 +54,24 @@ python main.py
 ### macOS
 ```bash
 cd ~/Desktop/12306-ticket-helper
-bash scripts/build_macos.sh v1.1.1
+bash scripts/build_macos.sh v1.1.2
 ```
 产物：
 - `dist/12306余票助手.app`
-- `12306-ticket-helper-macos-v1.1.1.zip`
+- `12306-ticket-helper-macos-v1.1.2.zip`
 
 ### Windows
 在 `cmd` 或 `PowerShell` 中执行：
 ```bat
 cd %USERPROFILE%\Desktop\12306-ticket-helper
-scripts\build_windows.bat v1.1.1
+scripts\build_windows.bat v1.1.2
 ```
 产物：
 - `dist\12306余票助手\12306余票助手.exe`
-- `12306-ticket-helper-windows-v1.1.1.zip`
+- `12306-ticket-helper-windows-v1.1.2.zip`
 
 ## Releases
-- 推送 tag（如 `v1.1.1`）后，GitHub Actions 会自动构建 Windows + macOS 包并上传到对应 Release。
+- 推送 tag（如 `v1.1.2`）后，GitHub Actions 会自动构建 Windows + macOS 包并上传到对应 Release。
 - 也可在 Actions 页手动触发 `Build Release Assets`，输入目标 tag 后执行。
 
 ## 目录

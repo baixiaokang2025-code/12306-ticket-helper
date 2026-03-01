@@ -91,9 +91,13 @@ class App:
         self.querying = False
         self.monitoring = False
         self.after_job: str | None = None
+        self.assist_countdown_job: str | None = None
+        self.assist_countdown_left = 0
         self.alerted_keys: set[str] = set()
         self.result_row_map: Dict[str, DisplayRow] = {}
         self.transfer_row_map: Dict[str, TransferPlan] = {}
+        self.last_direct_recommend: Optional[DisplayRow] = None
+        self.last_transfer_recommend: Optional[TransferPlan] = None
         self.error_stats: Dict[str, Dict[str, str]] = {}
 
         self.settings_path = Path(__file__).with_name("settings.json")
@@ -119,6 +123,9 @@ class App:
         self.transfer_min_layover_var = tk.IntVar(value=max(5, self.settings.transfer_min_layover_min))
         self.transfer_max_layover_var = tk.IntVar(value=max(30, self.settings.transfer_max_layover_min))
         self.transfer_max_plans_var = tk.IntVar(value=max(1, self.settings.transfer_max_plans))
+        self.assist_countdown_sec_var = tk.IntVar(value=max(5, self.settings.assist_countdown_sec))
+        self.copy_alert_var = tk.BooleanVar(value=self.settings.copy_alert_to_clipboard)
+        self.assist_countdown_text_var = tk.StringVar(value="抢票指引：等待命中后自动提示")
         self.status_var = tk.StringVar(value="就绪")
         self.route_count_var = tk.StringVar(value="线路数：0")
 
@@ -203,9 +210,17 @@ class App:
         ttk.Spinbox(ctrl, from_=30, to=1440, textvariable=self.transfer_max_layover_var, width=8).grid(row=2, column=7, pady=4)
         ttk.Label(ctrl, text="最多方案").grid(row=2, column=8, sticky=tk.W, padx=(14, 4), pady=4)
         ttk.Spinbox(ctrl, from_=1, to=20, textvariable=self.transfer_max_plans_var, width=6).grid(row=2, column=9, pady=4)
+        ttk.Label(ctrl, text="人工提交倒计时(秒)").grid(row=3, column=0, columnspan=2, sticky=tk.W, padx=(0, 4), pady=4)
+        ttk.Spinbox(ctrl, from_=5, to=120, textvariable=self.assist_countdown_sec_var, width=8).grid(row=3, column=2, pady=4, sticky=tk.W)
+        ttk.Checkbutton(ctrl, text="命中后复制信息到剪贴板", variable=self.copy_alert_var).grid(
+            row=3, column=3, columnspan=4, sticky=tk.W, padx=(14, 4), pady=4
+        )
+        ttk.Label(ctrl, textvariable=self.assist_countdown_text_var).grid(
+            row=3, column=7, columnspan=3, sticky=tk.W, padx=(14, 0), pady=4
+        )
 
         btns = ttk.Frame(ctrl)
-        btns.grid(row=0, column=10, rowspan=3, padx=(16, 0), sticky=tk.E)
+        btns.grid(row=0, column=10, rowspan=4, padx=(16, 0), sticky=tk.E)
         self.query_btn = ttk.Button(btns, text="立即查询", command=self.trigger_query)
         self.query_btn.pack(side=tk.LEFT, padx=3)
         self.start_btn = ttk.Button(btns, text="开始监控", command=self.start_monitor)
@@ -214,6 +229,9 @@ class App:
         self.stop_btn.pack(side=tk.LEFT, padx=3)
         ttk.Button(btns, text="打开12306官网", command=self.open_web).pack(side=tk.LEFT, padx=3)
         ttk.Button(btns, text="打开选中下单页", command=self.open_selected_order_page).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btns, text="打开推荐直达", command=self.open_recommended_direct_page).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btns, text="打开推荐中转首段", command=self.open_recommended_transfer_first_leg).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btns, text="打开推荐中转次段", command=self.open_recommended_transfer_second_leg).pack(side=tk.LEFT, padx=3)
         ttk.Button(btns, text="保存设置", command=self.save_current_settings).pack(side=tk.LEFT, padx=3)
 
         routes_frame = ttk.LabelFrame(parent, text="线路管理（支持多线路）", padding=10)
@@ -566,6 +584,24 @@ class App:
     def open_web(self) -> None:
         webbrowser.open("https://kyfw.12306.cn/otn/leftTicket/init")
 
+    def open_recommended_direct_page(self) -> None:
+        if not self.last_direct_recommend:
+            messagebox.showinfo("提示", "当前没有推荐的直达车次，请先查询并等待命中")
+            return
+        self._open_display_row_order_page(self.last_direct_recommend, prefix="推荐直达")
+
+    def open_recommended_transfer_first_leg(self) -> None:
+        if not self.last_transfer_recommend:
+            messagebox.showinfo("提示", "当前没有推荐的中转方案，请先查询并等待命中")
+            return
+        self._open_transfer_leg_page(self.last_transfer_recommend, is_first_leg=True, prefix="推荐中转")
+
+    def open_recommended_transfer_second_leg(self) -> None:
+        if not self.last_transfer_recommend:
+            messagebox.showinfo("提示", "当前没有推荐的中转方案，请先查询并等待命中")
+            return
+        self._open_transfer_leg_page(self.last_transfer_recommend, is_first_leg=False, prefix="推荐中转")
+
     def open_selected_transfer_first_leg(self) -> None:
         self._open_selected_transfer_leg(is_first_leg=True)
 
@@ -581,6 +617,9 @@ class App:
         if not plan:
             messagebox.showwarning("提示", "未找到选中中转记录，请重新查询后再试")
             return
+        self._open_transfer_leg_page(plan, is_first_leg=is_first_leg, prefix="选中中转")
+
+    def _open_transfer_leg_page(self, plan: TransferPlan, *, is_first_leg: bool, prefix: str) -> None:
         from_station = plan.route.from_station if is_first_leg else plan.via_station
         to_station = plan.via_station if is_first_leg else plan.route.to_station
         train_date = plan.route.train_date if is_first_leg else plan.second_depart_at.strftime("%Y-%m-%d")
@@ -595,7 +634,7 @@ class App:
             return
         webbrowser.open(url)
         leg_text = "首段" if is_first_leg else "次段"
-        self.status_var.set(f"已打开选中中转{leg_text}下单页（需你手动确认下单与支付）")
+        self.status_var.set(f"已打开{prefix}{leg_text}下单页（需你手动确认下单与支付）")
 
     def open_selected_order_page(self) -> None:
         selected = self.result_tree.selection()
@@ -608,7 +647,9 @@ class App:
         if not display:
             messagebox.showwarning("提示", "未找到选中记录，请重新查询后再试")
             return
+        self._open_display_row_order_page(display, prefix="选中线路")
 
+    def _open_display_row_order_page(self, display: DisplayRow, *, prefix: str) -> None:
         try:
             url = self.client.build_left_ticket_url(
                 train_date=display.route.train_date,
@@ -620,7 +661,7 @@ class App:
             return
 
         webbrowser.open(url)
-        self.status_var.set("已打开选中线路下单页（需你手动确认下单与支付）")
+        self.status_var.set(f"已打开{prefix}下单页（需你手动确认下单与支付）")
 
     def clear_cookie_text(self) -> None:
         self.cookie_var.set("")
@@ -695,6 +736,10 @@ class App:
         if self.after_job:
             self.root.after_cancel(self.after_job)
             self.after_job = None
+        if self.assist_countdown_job:
+            self.root.after_cancel(self.assist_countdown_job)
+            self.assist_countdown_job = None
+            self.assist_countdown_text_var.set("抢票指引：等待命中后自动提示")
         self.status_var.set("监控已停止")
 
     def schedule_next(self) -> None:
@@ -763,6 +808,8 @@ class App:
         filtered = self._apply_filters(rows)
         self._render_rows(filtered)
         self._render_transfer_plans(transfer_plans)
+        self.last_direct_recommend = self._pick_direct_recommend(filtered)
+        self.last_transfer_recommend = transfer_plans[0] if transfer_plans else None
         ticket_lines, candidate_lines = self._collect_new_alerts(filtered)
         transfer_lines = self._collect_transfer_alerts(transfer_plans)
         all_lines = ticket_lines + candidate_lines + transfer_lines
@@ -777,7 +824,13 @@ class App:
                 title = "候补提醒"
             else:
                 title = "中转提醒"
-            messagebox.showinfo(title, f"发现可用车次：\n{preview}\n\n请尽快前往12306官网下单。")
+            countdown_sec = max(5, int(self.assist_countdown_sec_var.get()))
+            messagebox.showinfo(
+                title,
+                f"发现可用车次：\n{preview}\n\n"
+                f"建议在 {countdown_sec} 秒内打开推荐下单页并手动提交订单（支付仍需你本人确认）。",
+            )
+            self._assist_user_after_hit(all_lines, countdown_sec=countdown_sec)
             self._send_notifications_async(all_lines, title=f"12306{title}")
 
         now = datetime.now().strftime("%H:%M:%S")
@@ -794,6 +847,46 @@ class App:
             self.status_var.set(f"查询完成：{len(filtered)} 条（{now}）{reminder_text}")
 
         self.schedule_next()
+
+    def _assist_user_after_hit(self, lines: List[str], *, countdown_sec: int) -> None:
+        if self.copy_alert_var.get():
+            payload = "\n".join(lines[:20])
+            self._copy_text_to_clipboard(payload)
+        self._start_assist_countdown(countdown_sec)
+
+    def _copy_text_to_clipboard(self, text: str) -> None:
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update_idletasks()
+            self.status_var.set("命中信息已复制到剪贴板，可直接粘贴给家人或同事协助抢票")
+        except tk.TclError:
+            pass
+
+    def _start_assist_countdown(self, seconds: int) -> None:
+        self.assist_countdown_left = max(5, int(seconds))
+        if self.assist_countdown_job:
+            self.root.after_cancel(self.assist_countdown_job)
+            self.assist_countdown_job = None
+        self._tick_assist_countdown()
+
+    def _tick_assist_countdown(self) -> None:
+        left = max(0, int(self.assist_countdown_left))
+        if left <= 0:
+            self.assist_countdown_text_var.set("抢票指引：请尽快在12306页面手动提交订单")
+            self.assist_countdown_job = None
+            return
+        self.assist_countdown_text_var.set(
+            f"抢票指引：{left} 秒内点击“打开推荐直达/中转”并手动提交（支付由你确认）"
+        )
+        self.assist_countdown_left = left - 1
+        self.assist_countdown_job = self.root.after(1000, self._tick_assist_countdown)
+
+    def _pick_direct_recommend(self, rows: List[DisplayRow]) -> Optional[DisplayRow]:
+        for item in rows:
+            if self._row_passes_seat_filter(item.row):
+                return item
+        return None
 
     def _build_retry_policy(self) -> RetryPolicy:
         attempts = max(1, int(self.retry_attempts_var.get()))
@@ -1318,6 +1411,8 @@ class App:
             transfer_min_layover_min=min_layover,
             transfer_max_layover_min=max_layover,
             transfer_max_plans=max(1, int(self.transfer_max_plans_var.get())),
+            assist_countdown_sec=max(5, int(self.assist_countdown_sec_var.get())),
+            copy_alert_to_clipboard=self.copy_alert_var.get(),
             email=self._build_email_config(),
             wecom=self._build_wecom_config(),
         )
@@ -1335,6 +1430,12 @@ class App:
         self.status_var.set("设置已保存")
 
     def on_close(self) -> None:
+        if self.after_job:
+            self.root.after_cancel(self.after_job)
+            self.after_job = None
+        if self.assist_countdown_job:
+            self.root.after_cancel(self.assist_countdown_job)
+            self.assist_countdown_job = None
         self.save_current_settings(silent=True)
         self.root.destroy()
 

@@ -51,6 +51,8 @@ class AppSettings:
     transfer_min_layover_min: int = 20
     transfer_max_layover_min: int = 240
     transfer_max_plans: int = 8
+    assist_countdown_sec: int = 20
+    copy_alert_to_clipboard: bool = True
     email: EmailConfig = field(default_factory=EmailConfig)
     wecom: WeComConfig = field(default_factory=WeComConfig)
 
@@ -142,6 +144,8 @@ def load_settings(path: Path) -> AppSettings:
         transfer_min_layover_min=max(5, _to_int(data.get("transfer_min_layover_min"), 20)),
         transfer_max_layover_min=max(30, _to_int(data.get("transfer_max_layover_min"), 240)),
         transfer_max_plans=max(1, _to_int(data.get("transfer_max_plans"), 8)),
+        assist_countdown_sec=max(5, _to_int(data.get("assist_countdown_sec"), 20)),
+        copy_alert_to_clipboard=_to_bool(data.get("copy_alert_to_clipboard"), True),
         email=email,
         wecom=wecom,
     )
