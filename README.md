@@ -28,7 +28,7 @@
 
 ## 本地运行
 ```bash
-cd ~/Desktop/12306-ui-helper
+cd ~/Desktop/12306-ticket-helper
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -47,7 +47,7 @@ python main.py
 ## 打包
 ### macOS
 ```bash
-cd ~/Desktop/12306-ui-helper
+cd ~/Desktop/12306-ticket-helper
 bash scripts/build_macos.sh
 ```
 产物：`dist/12306余票助手.app`
@@ -55,7 +55,7 @@ bash scripts/build_macos.sh
 ### Windows
 在 `cmd` 或 `PowerShell` 中执行：
 ```bat
-cd %USERPROFILE%\Desktop\12306-ui-helper
+cd %USERPROFILE%\Desktop\12306-ticket-helper
 scripts\build_windows.bat
 ```
 产物：`dist\12306余票助手\12306余票助手.exe`
