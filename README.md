@@ -52,17 +52,25 @@ python main.py
 ### macOS
 ```bash
 cd ~/Desktop/12306-ticket-helper
-bash scripts/build_macos.sh
+bash scripts/build_macos.sh v1.1.0
 ```
-产物：`dist/12306余票助手.app`
+产物：
+- `dist/12306余票助手.app`
+- `12306-ticket-helper-macos-v1.1.0.zip`
 
 ### Windows
 在 `cmd` 或 `PowerShell` 中执行：
 ```bat
 cd %USERPROFILE%\Desktop\12306-ticket-helper
-scripts\build_windows.bat
+scripts\build_windows.bat v1.1.0
 ```
-产物：`dist\12306余票助手\12306余票助手.exe`
+产物：
+- `dist\12306余票助手\12306余票助手.exe`
+- `12306-ticket-helper-windows-v1.1.0.zip`
+
+## Releases
+- 推送 tag（如 `v1.1.0`）后，GitHub Actions 会自动构建 Windows + macOS 包并上传到对应 Release。
+- 也可在 Actions 页手动触发 `Build Release Assets`，输入目标 tag 后执行。
 
 ## 目录
 - `main.py`：主界面与监控逻辑
