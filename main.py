@@ -17,12 +17,29 @@ from notifier import NotificationSender
 from ticket_client import QueryRequestError, RetryPolicy, TicketQueryClient, TicketRow
 
 SEAT_OPTIONS = ["任意", "商务座", "一等座", "二等座", "软卧", "硬卧", "硬座", "无座"]
+DEFAULT_TRANSFER_HUBS = ["北京南", "上海虹桥", "南京南", "杭州东", "武汉", "郑州东", "西安北", "长沙南"]
 
 
 @dataclass
 class DisplayRow:
     route: RouteItem
     row: TicketRow
+
+
+@dataclass
+class TransferPlan:
+    route: RouteItem
+    via_station: str
+    first_row: TicketRow
+    second_row: TicketRow
+    first_depart_at: datetime
+    first_arrive_at: datetime
+    second_depart_at: datetime
+    second_arrive_at: datetime
+    wait_minutes: int
+    total_minutes: int
+    seat_hint: str
+    seat_score: int
 
 
 def has_ticket(value: str) -> bool:
@@ -76,6 +93,7 @@ class App:
         self.after_job: str | None = None
         self.alerted_keys: set[str] = set()
         self.result_row_map: Dict[str, DisplayRow] = {}
+        self.transfer_row_map: Dict[str, TransferPlan] = {}
         self.error_stats: Dict[str, Dict[str, str]] = {}
 
         self.settings_path = Path(__file__).with_name("settings.json")
@@ -96,6 +114,11 @@ class App:
         self.retry_base_delay_var = tk.DoubleVar(value=max(0.1, self.settings.retry_base_delay_sec))
         self.retry_max_delay_var = tk.DoubleVar(value=max(0.2, self.settings.retry_max_delay_sec))
         self.request_timeout_var = tk.DoubleVar(value=max(2.0, self.settings.request_timeout_sec))
+        self.transfer_enabled_var = tk.BooleanVar(value=self.settings.transfer_enabled)
+        self.transfer_hubs_var = tk.StringVar(value=self.settings.transfer_hubs)
+        self.transfer_min_layover_var = tk.IntVar(value=max(5, self.settings.transfer_min_layover_min))
+        self.transfer_max_layover_var = tk.IntVar(value=max(30, self.settings.transfer_max_layover_min))
+        self.transfer_max_plans_var = tk.IntVar(value=max(1, self.settings.transfer_max_plans))
         self.status_var = tk.StringVar(value="就绪")
         self.route_count_var = tk.StringVar(value="线路数：0")
 
@@ -169,8 +192,20 @@ class App:
             row=1, column=7, pady=4
         )
 
+        ttk.Checkbutton(ctrl, text="启用智能中转", variable=self.transfer_enabled_var).grid(
+            row=2, column=0, columnspan=2, sticky=tk.W, padx=(0, 4), pady=4
+        )
+        ttk.Label(ctrl, text="中转站(逗号分隔)").grid(row=2, column=2, sticky=tk.W, padx=(14, 4), pady=4)
+        ttk.Entry(ctrl, textvariable=self.transfer_hubs_var, width=20).grid(row=2, column=3, pady=4, sticky=tk.W)
+        ttk.Label(ctrl, text="最短换乘(分)").grid(row=2, column=4, sticky=tk.W, padx=(14, 4), pady=4)
+        ttk.Spinbox(ctrl, from_=5, to=360, textvariable=self.transfer_min_layover_var, width=8).grid(row=2, column=5, pady=4)
+        ttk.Label(ctrl, text="最长换乘(分)").grid(row=2, column=6, sticky=tk.W, padx=(14, 4), pady=4)
+        ttk.Spinbox(ctrl, from_=30, to=1440, textvariable=self.transfer_max_layover_var, width=8).grid(row=2, column=7, pady=4)
+        ttk.Label(ctrl, text="最多方案").grid(row=2, column=8, sticky=tk.W, padx=(14, 4), pady=4)
+        ttk.Spinbox(ctrl, from_=1, to=20, textvariable=self.transfer_max_plans_var, width=6).grid(row=2, column=9, pady=4)
+
         btns = ttk.Frame(ctrl)
-        btns.grid(row=0, column=8, rowspan=2, padx=(16, 0), sticky=tk.E)
+        btns.grid(row=0, column=10, rowspan=3, padx=(16, 0), sticky=tk.E)
         self.query_btn = ttk.Button(btns, text="立即查询", command=self.trigger_query)
         self.query_btn.pack(side=tk.LEFT, padx=3)
         self.start_btn = ttk.Button(btns, text="开始监控", command=self.start_monitor)
@@ -306,6 +341,46 @@ class App:
 
         self.result_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         result_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+
+        transfer_frame = ttk.LabelFrame(parent, text="智能中转方案（1次中转）", padding=8)
+        transfer_frame.pack(fill=tk.BOTH, expand=False, padx=4, pady=(0, 4))
+        action_row = ttk.Frame(transfer_frame)
+        action_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(action_row, text="打开选中中转首段", command=self.open_selected_transfer_first_leg).pack(side=tk.LEFT)
+        ttk.Button(action_row, text="打开选中中转次段", command=self.open_selected_transfer_second_leg).pack(side=tk.LEFT, padx=6)
+        self.transfer_summary_var = tk.StringVar(value="暂无中转方案")
+        ttk.Label(action_row, textvariable=self.transfer_summary_var).pack(side=tk.LEFT, padx=(12, 0))
+
+        transfer_cols = ("route_date", "route_pair", "plan", "first", "second", "wait", "total", "seat")
+        self.transfer_tree = ttk.Treeview(transfer_frame, columns=transfer_cols, show="headings", height=6)
+        transfer_headers = {
+            "route_date": "日期",
+            "route_pair": "线路",
+            "plan": "中转站",
+            "first": "第一程",
+            "second": "第二程",
+            "wait": "换乘等待",
+            "total": "总耗时",
+            "seat": "座位建议",
+        }
+        transfer_widths = {
+            "route_date": 95,
+            "route_pair": 150,
+            "plan": 110,
+            "first": 220,
+            "second": 220,
+            "wait": 90,
+            "total": 90,
+            "seat": 250,
+        }
+        for key in transfer_cols:
+            self.transfer_tree.heading(key, text=transfer_headers[key])
+            self.transfer_tree.column(key, width=transfer_widths[key], anchor=tk.CENTER)
+
+        transfer_scroll_y = ttk.Scrollbar(transfer_frame, orient=tk.VERTICAL, command=self.transfer_tree.yview)
+        self.transfer_tree.configure(yscrollcommand=transfer_scroll_y.set)
+        self.transfer_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        transfer_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
 
     def _build_notify_tab(self, parent: ttk.Frame) -> None:
         mail_frame = ttk.LabelFrame(parent, text="邮件通知", padding=10)
@@ -491,6 +566,37 @@ class App:
     def open_web(self) -> None:
         webbrowser.open("https://kyfw.12306.cn/otn/leftTicket/init")
 
+    def open_selected_transfer_first_leg(self) -> None:
+        self._open_selected_transfer_leg(is_first_leg=True)
+
+    def open_selected_transfer_second_leg(self) -> None:
+        self._open_selected_transfer_leg(is_first_leg=False)
+
+    def _open_selected_transfer_leg(self, *, is_first_leg: bool) -> None:
+        selected = self.transfer_tree.selection()
+        if not selected:
+            messagebox.showwarning("提示", "请先在中转方案表格中选择一行")
+            return
+        plan = self.transfer_row_map.get(selected[0])
+        if not plan:
+            messagebox.showwarning("提示", "未找到选中中转记录，请重新查询后再试")
+            return
+        from_station = plan.route.from_station if is_first_leg else plan.via_station
+        to_station = plan.via_station if is_first_leg else plan.route.to_station
+        train_date = plan.route.train_date if is_first_leg else plan.second_depart_at.strftime("%Y-%m-%d")
+        try:
+            url = self.client.build_left_ticket_url(
+                train_date=train_date,
+                from_station=from_station,
+                to_station=to_station,
+            )
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("打开失败", f"无法生成下单链接：{exc}")
+            return
+        webbrowser.open(url)
+        leg_text = "首段" if is_first_leg else "次段"
+        self.status_var.set(f"已打开选中中转{leg_text}下单页（需你手动确认下单与支付）")
+
     def open_selected_order_page(self) -> None:
         selected = self.result_tree.selection()
         if not selected:
@@ -615,36 +721,51 @@ class App:
     def _query_in_thread(self, routes: List[RouteItem]) -> None:
         rows: List[DisplayRow] = []
         errors: List[Tuple[str, str, str]] = []
+        transfer_plans: List[TransferPlan] = []
         policy = self._build_retry_policy()
+        query_cache: Dict[Tuple[str, str, str], List[TicketRow]] = {}
 
         for index, route in enumerate(routes):
-            try:
-                route_rows = self.client.query(
-                    route.train_date,
-                    route.from_station,
-                    route.to_station,
-                    retry_policy=policy,
+            route_text = f"[{route.group}] {route.train_date} {route.from_station}->{route.to_station}"
+            route_rows = self._query_route_rows_with_cache(
+                train_date=route.train_date,
+                from_station=route.from_station,
+                to_station=route.to_station,
+                route_text=route_text,
+                retry_policy=policy,
+                query_cache=query_cache,
+                errors=errors,
+            )
+            rows.extend([DisplayRow(route=route, row=item) for item in route_rows])
+            if self.transfer_enabled_var.get():
+                transfer_plans.extend(
+                    self._build_transfer_plans_for_route(
+                        route=route,
+                        retry_policy=policy,
+                        query_cache=query_cache,
+                        errors=errors,
+                    )
                 )
-                rows.extend([DisplayRow(route=route, row=item) for item in route_rows])
-            except QueryRequestError as exc:
-                route_text = f"[{route.group}] {route.train_date} {route.from_station}->{route.to_station}"
-                errors.append((route_text, exc.category, str(exc)))
-            except Exception as exc:  # noqa: BLE001
-                route_text = f"[{route.group}] {route.train_date} {route.from_station}->{route.to_station}"
-                errors.append((route_text, "未知", str(exc)))
             if index < len(routes) - 1:
                 time.sleep(random.uniform(0.4, 1.0))
 
-        self.root.after(0, lambda: self.on_query_done(rows, errors))
+        self.root.after(0, lambda: self.on_query_done(rows, errors, transfer_plans))
 
-    def on_query_done(self, rows: List[DisplayRow], errors: List[Tuple[str, str, str]]) -> None:
+    def on_query_done(
+        self,
+        rows: List[DisplayRow],
+        errors: List[Tuple[str, str, str]],
+        transfer_plans: List[TransferPlan],
+    ) -> None:
         self.querying = False
         self.query_btn.config(state=tk.NORMAL)
 
         filtered = self._apply_filters(rows)
         self._render_rows(filtered)
+        self._render_transfer_plans(transfer_plans)
         ticket_lines, candidate_lines = self._collect_new_alerts(filtered)
-        all_lines = ticket_lines + candidate_lines
+        transfer_lines = self._collect_transfer_alerts(transfer_plans)
+        all_lines = ticket_lines + candidate_lines + transfer_lines
         if all_lines:
             self.root.bell()
             preview = "\n".join(all_lines[:8])
@@ -652,8 +773,10 @@ class App:
                 title = "有票+候补提醒"
             elif ticket_lines:
                 title = "有票提醒"
-            else:
+            elif candidate_lines:
                 title = "候补提醒"
+            else:
+                title = "中转提醒"
             messagebox.showinfo(title, f"发现可用车次：\n{preview}\n\n请尽快前往12306官网下单。")
             self._send_notifications_async(all_lines, title=f"12306{title}")
 
@@ -661,6 +784,8 @@ class App:
         reminder_text = ""
         if ticket_lines or candidate_lines:
             reminder_text = f" | 新提醒 有票{len(ticket_lines)} 候补{len(candidate_lines)}"
+        if transfer_lines:
+            reminder_text += f" 中转{len(transfer_lines)}"
         if errors:
             self._record_errors(errors)
             short_err = "；".join([f"{item[0]} {item[2]}" for item in errors[:2]])
@@ -681,6 +806,330 @@ class App:
             max_delay_sec=max_delay,
             timeout_sec=timeout_sec,
         )
+
+    def _query_route_rows_with_cache(
+        self,
+        *,
+        train_date: str,
+        from_station: str,
+        to_station: str,
+        route_text: str,
+        retry_policy: RetryPolicy,
+        query_cache: Dict[Tuple[str, str, str], List[TicketRow]],
+        errors: List[Tuple[str, str, str]],
+    ) -> List[TicketRow]:
+        cache_key = (train_date, from_station, to_station)
+        if cache_key in query_cache:
+            return query_cache[cache_key]
+        try:
+            rows = self.client.query(
+                train_date=train_date,
+                from_station=from_station,
+                to_station=to_station,
+                retry_policy=retry_policy,
+            )
+            query_cache[cache_key] = rows
+            return rows
+        except QueryRequestError as exc:
+            errors.append((route_text, exc.category, str(exc)))
+        except Exception as exc:  # noqa: BLE001
+            errors.append((route_text, "未知", str(exc)))
+        query_cache[cache_key] = []
+        return []
+
+    def _build_transfer_plans_for_route(
+        self,
+        *,
+        route: RouteItem,
+        retry_policy: RetryPolicy,
+        query_cache: Dict[Tuple[str, str, str], List[TicketRow]],
+        errors: List[Tuple[str, str, str]],
+    ) -> List[TransferPlan]:
+        min_wait = max(5, int(self.transfer_min_layover_var.get()))
+        max_wait = max(min_wait + 5, int(self.transfer_max_layover_var.get()))
+        max_plans = max(1, int(self.transfer_max_plans_var.get()))
+        hubs = self._resolve_transfer_hubs(route)
+        if not hubs:
+            return []
+
+        next_day = self._next_date_text(route.train_date)
+        if not next_day:
+            return []
+
+        plans: List[TransferPlan] = []
+        for hub in hubs:
+            route_label = f"[{route.group}] {route.train_date} {route.from_station}->{route.to_station} 经 {hub}"
+            first_rows = self._query_route_rows_with_cache(
+                train_date=route.train_date,
+                from_station=route.from_station,
+                to_station=hub,
+                route_text=f"{route_label}（第一程）",
+                retry_policy=retry_policy,
+                query_cache=query_cache,
+                errors=errors,
+            )
+            if not first_rows:
+                continue
+            second_rows_today = self._query_route_rows_with_cache(
+                train_date=route.train_date,
+                from_station=hub,
+                to_station=route.to_station,
+                route_text=f"{route_label}（第二程当日）",
+                retry_policy=retry_policy,
+                query_cache=query_cache,
+                errors=errors,
+            )
+            second_rows_next = self._query_route_rows_with_cache(
+                train_date=next_day,
+                from_station=hub,
+                to_station=route.to_station,
+                route_text=f"{route_label}（第二程次日）",
+                retry_policy=retry_policy,
+                query_cache=query_cache,
+                errors=errors,
+            )
+            if not second_rows_today and not second_rows_next:
+                continue
+            for first_row in first_rows:
+                if not self._row_passes_seat_filter(first_row):
+                    continue
+                depart_1 = self._to_datetime(route.train_date, first_row.start_time)
+                duration_1 = self._duration_minutes(first_row.duration)
+                if depart_1 is None or duration_1 is None:
+                    continue
+                arrive_1 = depart_1 + timedelta(minutes=duration_1)
+                plans.extend(
+                    self._build_transfer_plans_with_second_rows(
+                        route=route,
+                        via_station=hub,
+                        first_row=first_row,
+                        first_depart_at=depart_1,
+                        first_arrive_at=arrive_1,
+                        second_rows=second_rows_today,
+                        second_train_date=route.train_date,
+                        min_wait=min_wait,
+                        max_wait=max_wait,
+                    )
+                )
+                plans.extend(
+                    self._build_transfer_plans_with_second_rows(
+                        route=route,
+                        via_station=hub,
+                        first_row=first_row,
+                        first_depart_at=depart_1,
+                        first_arrive_at=arrive_1,
+                        second_rows=second_rows_next,
+                        second_train_date=next_day,
+                        min_wait=min_wait,
+                        max_wait=max_wait,
+                    )
+                )
+
+        plans = self._dedupe_transfer_plans(plans)
+        plans.sort(key=lambda item: (-item.seat_score, item.total_minutes, item.wait_minutes))
+        return plans[:max_plans]
+
+    def _build_transfer_plans_with_second_rows(
+        self,
+        *,
+        route: RouteItem,
+        via_station: str,
+        first_row: TicketRow,
+        first_depart_at: datetime,
+        first_arrive_at: datetime,
+        second_rows: List[TicketRow],
+        second_train_date: str,
+        min_wait: int,
+        max_wait: int,
+    ) -> List[TransferPlan]:
+        plans: List[TransferPlan] = []
+        for second_row in second_rows:
+            if not self._row_passes_seat_filter(second_row):
+                continue
+            depart_2 = self._to_datetime(second_train_date, second_row.start_time)
+            duration_2 = self._duration_minutes(second_row.duration)
+            if depart_2 is None or duration_2 is None:
+                continue
+            if depart_2 <= first_arrive_at:
+                continue
+            wait_minutes = int((depart_2 - first_arrive_at).total_seconds() / 60)
+            if wait_minutes < min_wait or wait_minutes > max_wait:
+                continue
+            arrive_2 = depart_2 + timedelta(minutes=duration_2)
+            total_minutes = int((arrive_2 - first_depart_at).total_seconds() / 60)
+            seat_hint, seat_score = self._build_transfer_seat_hint(first_row, second_row)
+            plans.append(
+                TransferPlan(
+                    route=route,
+                    via_station=via_station,
+                    first_row=first_row,
+                    second_row=second_row,
+                    first_depart_at=first_depart_at,
+                    first_arrive_at=first_arrive_at,
+                    second_depart_at=depart_2,
+                    second_arrive_at=arrive_2,
+                    wait_minutes=wait_minutes,
+                    total_minutes=total_minutes,
+                    seat_hint=seat_hint,
+                    seat_score=seat_score,
+                )
+            )
+        return plans
+
+    def _resolve_transfer_hubs(self, route: RouteItem) -> List[str]:
+        text = self.transfer_hubs_var.get().strip()
+        if not text:
+            raw_list = list(DEFAULT_TRANSFER_HUBS)
+        else:
+            raw_list = [item.strip() for item in re.split(r"[，,\s]+", text) if item.strip()]
+        out: List[str] = []
+        seen = set()
+        for station in raw_list:
+            if station in {route.from_station, route.to_station}:
+                continue
+            if station in seen:
+                continue
+            seen.add(station)
+            out.append(station)
+            if len(out) >= 8:
+                break
+        return out
+
+    def _next_date_text(self, train_date: str) -> Optional[str]:
+        try:
+            dt = datetime.strptime(train_date, "%Y-%m-%d")
+        except ValueError:
+            return None
+        return (dt + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    def _to_datetime(self, train_date: str, hhmm: str) -> Optional[datetime]:
+        text = (hhmm or "").strip()
+        try:
+            return datetime.strptime(f"{train_date} {text}", "%Y-%m-%d %H:%M")
+        except ValueError:
+            return None
+
+    def _duration_minutes(self, duration_text: str) -> Optional[int]:
+        text = (duration_text or "").strip()
+        if not text:
+            return None
+        match = re.match(r"^(\d{1,3}):(\d{2})$", text)
+        if not match:
+            return None
+        hours = int(match.group(1))
+        minutes = int(match.group(2))
+        return hours * 60 + minutes
+
+    def _row_passes_seat_filter(self, row: TicketRow) -> bool:
+        seat = self.seat_var.get()
+        if seat != "任意":
+            return has_ticket(row.seats.get(seat, "--"))
+        for seat_name in SEAT_OPTIONS:
+            if seat_name == "任意":
+                continue
+            if has_ticket(row.seats.get(seat_name, "--")):
+                return True
+        return False
+
+    def _seat_value_score(self, value: str) -> int:
+        text = (value or "").strip()
+        if not text or text in {"--", "无", "*"}:
+            return 0
+        if "候补" in text:
+            return 8
+        if text == "有":
+            return 60
+        if text.isdigit():
+            return min(80, 30 + int(text))
+        return 20
+
+    def _build_transfer_seat_hint(self, first_row: TicketRow, second_row: TicketRow) -> Tuple[str, int]:
+        seat = self.seat_var.get()
+        if seat != "任意":
+            first_v = first_row.seats.get(seat, "--")
+            second_v = second_row.seats.get(seat, "--")
+            score = self._seat_value_score(first_v) + self._seat_value_score(second_v)
+            return f"{seat} {first_v} / {second_v}", score
+        best_name = "二等座"
+        best_text = "无可用"
+        best_score = -1
+        for seat_name in SEAT_OPTIONS:
+            if seat_name == "任意":
+                continue
+            first_v = first_row.seats.get(seat_name, "--")
+            second_v = second_row.seats.get(seat_name, "--")
+            score = self._seat_value_score(first_v) + self._seat_value_score(second_v)
+            if score > best_score:
+                best_score = score
+                best_name = seat_name
+                best_text = f"{seat_name} {first_v} / {second_v}"
+        return best_text if best_score > 0 else f"{best_name} 无可用", max(0, best_score)
+
+    def _dedupe_transfer_plans(self, plans: List[TransferPlan]) -> List[TransferPlan]:
+        unique: List[TransferPlan] = []
+        seen = set()
+        for plan in plans:
+            key = (
+                plan.route.key(),
+                plan.via_station,
+                plan.first_row.train_no,
+                plan.second_row.train_no,
+                plan.first_depart_at.strftime("%Y-%m-%d %H:%M"),
+                plan.second_depart_at.strftime("%Y-%m-%d %H:%M"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(plan)
+        return unique
+
+    def _format_minutes(self, mins: int) -> str:
+        hours = mins // 60
+        minutes = mins % 60
+        return f"{hours}h{minutes:02d}m"
+
+    def _render_transfer_plans(self, plans: List[TransferPlan]) -> None:
+        self.transfer_row_map.clear()
+        for item in self.transfer_tree.get_children():
+            self.transfer_tree.delete(item)
+        if not self.transfer_enabled_var.get():
+            self.transfer_summary_var.set("智能中转已关闭")
+            return
+        if not plans:
+            self.transfer_summary_var.set("未发现满足条件的中转方案")
+            return
+        for plan in plans:
+            values = (
+                plan.route.train_date,
+                f"{plan.route.from_station}->{plan.route.to_station}",
+                plan.via_station,
+                f"{plan.first_row.train_no} {plan.first_row.start_time}-{plan.first_row.arrive_time}",
+                f"{plan.second_row.train_no} {plan.second_row.start_time}-{plan.second_row.arrive_time}",
+                self._format_minutes(plan.wait_minutes),
+                self._format_minutes(plan.total_minutes),
+                plan.seat_hint,
+            )
+            iid = self.transfer_tree.insert("", tk.END, values=values)
+            self.transfer_row_map[iid] = plan
+        self.transfer_summary_var.set(f"已生成 {len(plans)} 条中转方案")
+
+    def _collect_transfer_alerts(self, plans: List[TransferPlan]) -> List[str]:
+        lines: List[str] = []
+        for plan in plans:
+            key = (
+                f"{plan.route.key()}:{plan.via_station}:{plan.first_row.train_no}:{plan.second_row.train_no}:"
+                f"{plan.first_depart_at.strftime('%Y%m%d%H%M')}:{plan.second_depart_at.strftime('%Y%m%d%H%M')}"
+            )
+            if key in self.alerted_keys:
+                continue
+            self.alerted_keys.add(key)
+            lines.append(
+                "[中转] "
+                f"[{plan.route.train_date} {plan.route.from_station}->{plan.route.to_station}] "
+                f"经 {plan.via_station}：{plan.first_row.train_no}->{plan.second_row.train_no}，"
+                f"等待{plan.wait_minutes}分，{plan.seat_hint}"
+            )
+        return lines
 
     def _record_errors(self, errors: List[Tuple[str, str, str]]) -> None:
         for route_text, category, msg in errors:
@@ -853,6 +1302,8 @@ class App:
         self.status_var.set("测试通知发送中...")
 
     def _collect_settings(self) -> AppSettings:
+        min_layover = max(5, int(self.transfer_min_layover_var.get()))
+        max_layover = max(min_layover + 5, int(self.transfer_max_layover_var.get()))
         return AppSettings(
             interval_sec=max(2, int(self.interval_var.get())),
             train_filter=self.train_filter_var.get().strip(),
@@ -862,6 +1313,11 @@ class App:
             retry_base_delay_sec=max(0.1, float(self.retry_base_delay_var.get())),
             retry_max_delay_sec=max(0.2, float(self.retry_max_delay_var.get())),
             request_timeout_sec=max(2.0, float(self.request_timeout_var.get())),
+            transfer_enabled=self.transfer_enabled_var.get(),
+            transfer_hubs=self.transfer_hubs_var.get().strip(),
+            transfer_min_layover_min=min_layover,
+            transfer_max_layover_min=max_layover,
+            transfer_max_plans=max(1, int(self.transfer_max_plans_var.get())),
             email=self._build_email_config(),
             wecom=self._build_wecom_config(),
         )

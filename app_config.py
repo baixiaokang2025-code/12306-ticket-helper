@@ -46,6 +46,11 @@ class AppSettings:
     retry_base_delay_sec: float = 0.6
     retry_max_delay_sec: float = 4.0
     request_timeout_sec: float = 10.0
+    transfer_enabled: bool = False
+    transfer_hubs: str = ""
+    transfer_min_layover_min: int = 20
+    transfer_max_layover_min: int = 240
+    transfer_max_plans: int = 8
     email: EmailConfig = field(default_factory=EmailConfig)
     wecom: WeComConfig = field(default_factory=WeComConfig)
 
@@ -132,6 +137,11 @@ def load_settings(path: Path) -> AppSettings:
         retry_base_delay_sec=max(0.1, _to_float(data.get("retry_base_delay_sec"), 0.6)),
         retry_max_delay_sec=max(0.2, _to_float(data.get("retry_max_delay_sec"), 4.0)),
         request_timeout_sec=max(2.0, _to_float(data.get("request_timeout_sec"), 10.0)),
+        transfer_enabled=_to_bool(data.get("transfer_enabled"), False),
+        transfer_hubs=str(data.get("transfer_hubs", "")),
+        transfer_min_layover_min=max(5, _to_int(data.get("transfer_min_layover_min"), 20)),
+        transfer_max_layover_min=max(30, _to_int(data.get("transfer_max_layover_min"), 240)),
+        transfer_max_plans=max(1, _to_int(data.get("transfer_max_plans"), 8)),
         email=email,
         wecom=wecom,
     )
