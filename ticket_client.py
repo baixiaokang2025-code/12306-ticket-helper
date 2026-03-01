@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -44,6 +44,17 @@ class TicketQueryClient:
         self._name_to_code: Dict[str, str] = {}
         self._code_to_name: Dict[str, str] = {}
         self._warmed_up = False
+
+    def set_cookie_header(self, cookie_text: str) -> None:
+        value = (cookie_text or "").strip()
+        if value:
+            self.session.headers["Cookie"] = value
+        else:
+            self.clear_cookie_header()
+
+    def clear_cookie_header(self) -> None:
+        if "Cookie" in self.session.headers:
+            del self.session.headers["Cookie"]
 
     def warm_up(self) -> None:
         if self._warmed_up:
@@ -174,3 +185,34 @@ class TicketQueryClient:
                 )
             )
         return rows
+
+    def build_left_ticket_url(self, train_date: str, from_station: str, to_station: str) -> str:
+        from_code = self.resolve_station_code(from_station)
+        to_code = self.resolve_station_code(to_station)
+        # fs/ts uses "name,code" in official URL parameters.
+        return (
+            "https://kyfw.12306.cn/otn/leftTicket/init?"
+            f"linktypeid=dc&fs={from_station},{from_code}&ts={to_station},{to_code}&date={train_date}&flag=N,N,Y"
+        )
+
+    def check_login_status(self) -> Tuple[bool, str]:
+        """
+        Check whether current session cookie appears to be logged in.
+        Note: this only validates cookies in this app session, not browser session.
+        """
+        self.warm_up()
+        url = "https://kyfw.12306.cn/otn/login/checkUser"
+        try:
+            resp = self.session.post(url, data={"_json_att": ""}, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            return False, f"登录状态检测失败：{exc}"
+
+        flag = bool(data.get("data", {}).get("flag"))
+        message = data.get("messages") or data.get("validateMessages") or data.get("result_message") or ""
+        if isinstance(message, list):
+            message = "；".join([str(item) for item in message if item])
+        if not message:
+            message = "已登录" if flag else "未登录或Cookie无效"
+        return flag, str(message)

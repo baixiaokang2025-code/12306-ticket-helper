@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 import time
 from tkinter import messagebox, ttk
-from typing import List
+from typing import Dict, List, Tuple
 
 from app_config import AppSettings, EmailConfig, RouteItem, WeComConfig, load_settings, save_settings
 from notifier import NotificationSender
@@ -35,6 +35,11 @@ def has_ticket(value: str) -> bool:
     return True
 
 
+def is_candidate_ticket(value: str) -> bool:
+    text = (value or "").strip()
+    return bool(text) and "候补" in text
+
+
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -48,6 +53,7 @@ class App:
         self.monitoring = False
         self.after_job: str | None = None
         self.alerted_keys: set[str] = set()
+        self.result_row_map: Dict[str, DisplayRow] = {}
 
         self.settings_path = Path(__file__).with_name("settings.json")
         self.settings = load_settings(self.settings_path)
@@ -74,6 +80,8 @@ class App:
 
         self.wecom_enabled_var = tk.BooleanVar(value=self.settings.wecom.enabled)
         self.wecom_webhook_var = tk.StringVar(value=self.settings.wecom.webhook)
+        self.cookie_var = tk.StringVar()
+        self.login_state_var = tk.StringVar(value="登录状态：未检测")
 
         self._build_ui()
         self._refresh_route_tree()
@@ -119,6 +127,7 @@ class App:
         self.stop_btn = ttk.Button(btns, text="停止监控", command=self.stop_monitor, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=3)
         ttk.Button(btns, text="打开12306官网", command=self.open_web).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btns, text="打开选中下单页", command=self.open_selected_order_page).pack(side=tk.LEFT, padx=3)
         ttk.Button(btns, text="保存设置", command=self.save_current_settings).pack(side=tk.LEFT, padx=3)
 
         routes_frame = ttk.LabelFrame(parent, text="线路管理（支持多线路）", padding=10)
@@ -155,7 +164,7 @@ class App:
         self.route_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
         route_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        tip = ttk.Label(parent, text="说明：仅做余票查询与提醒，不自动下单。", padding=(8, 4, 8, 0))
+        tip = ttk.Label(parent, text="说明：仅做余票查询/候补提醒与跳转，不自动下单。", padding=(8, 4, 8, 0))
         tip.pack(anchor=tk.W)
 
         result_frame = ttk.LabelFrame(parent, text="余票结果", padding=8)
@@ -257,6 +266,14 @@ class App:
         ttk.Label(wecom_frame, text="Webhook").grid(row=1, column=0, sticky=tk.W, padx=(0, 4), pady=3)
         ttk.Entry(wecom_frame, textvariable=self.wecom_webhook_var, width=100).grid(row=1, column=1, sticky=tk.W, pady=3)
 
+        login_frame = ttk.LabelFrame(parent, text="12306登录状态检测（可选）", padding=10)
+        login_frame.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Label(login_frame, text="Cookie").grid(row=0, column=0, sticky=tk.W, padx=(0, 4), pady=3)
+        ttk.Entry(login_frame, textvariable=self.cookie_var, width=100).grid(row=0, column=1, sticky=tk.W, pady=3)
+        ttk.Button(login_frame, text="检测登录状态", command=self.check_login_status).grid(row=0, column=2, padx=6, pady=3)
+        ttk.Button(login_frame, text="清空Cookie", command=self.clear_cookie_text).grid(row=0, column=3, padx=4, pady=3)
+        ttk.Label(login_frame, textvariable=self.login_state_var).grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=(2, 0))
+
         action_frame = ttk.Frame(parent)
         action_frame.pack(fill=tk.X, padx=6, pady=(4, 6))
         ttk.Button(action_frame, text="发送测试通知", command=self.send_test_notification).pack(side=tk.LEFT)
@@ -267,7 +284,8 @@ class App:
             text=(
                 "提示：\n"
                 "1) 邮件通常需填写 SMTP 授权码，而不是登录密码。\n"
-                "2) 企业微信机器人 webhook 可在群机器人设置中获取。"
+                "2) 企业微信机器人 webhook 可在群机器人设置中获取。\n"
+                "3) 登录状态检测只校验你粘贴的 Cookie，不会读取浏览器登录态。"
             ),
             justify=tk.LEFT,
             padding=(6, 0, 6, 0),
@@ -333,6 +351,48 @@ class App:
     def open_web(self) -> None:
         webbrowser.open("https://kyfw.12306.cn/otn/leftTicket/init")
 
+    def open_selected_order_page(self) -> None:
+        selected = self.result_tree.selection()
+        if not selected:
+            messagebox.showwarning("提示", "请先在结果表格中选择一行")
+            return
+
+        item_id = selected[0]
+        display = self.result_row_map.get(item_id)
+        if not display:
+            messagebox.showwarning("提示", "未找到选中记录，请重新查询后再试")
+            return
+
+        try:
+            url = self.client.build_left_ticket_url(
+                train_date=display.route.train_date,
+                from_station=display.route.from_station,
+                to_station=display.route.to_station,
+            )
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("打开失败", f"无法生成下单链接：{exc}")
+            return
+
+        webbrowser.open(url)
+        self.status_var.set("已打开选中线路下单页（需你手动确认下单与支付）")
+
+    def clear_cookie_text(self) -> None:
+        self.cookie_var.set("")
+        self.client.clear_cookie_header()
+        self.login_state_var.set("登录状态：未检测")
+        self.status_var.set("已清空Cookie")
+
+    def check_login_status(self) -> None:
+        cookie = self.cookie_var.get().strip()
+        self.client.set_cookie_header(cookie)
+        ok, message = self.client.check_login_status()
+        if ok:
+            self.login_state_var.set(f"登录状态：已登录（{message}）")
+            self.status_var.set("12306登录状态检测：已登录")
+        else:
+            self.login_state_var.set(f"登录状态：未登录/无效（{message}）")
+            self.status_var.set("12306登录状态检测：未登录或Cookie无效")
+
     def start_monitor(self) -> None:
         if not self._get_routes_for_query():
             return
@@ -394,19 +454,29 @@ class App:
 
         filtered = self._apply_filters(rows)
         self._render_rows(filtered)
-        alert_lines = self._collect_new_alerts(filtered)
-        if alert_lines:
+        ticket_lines, candidate_lines = self._collect_new_alerts(filtered)
+        all_lines = ticket_lines + candidate_lines
+        if all_lines:
             self.root.bell()
-            preview = "\n".join(alert_lines[:8])
-            messagebox.showinfo("有票提醒", f"发现可购车次：\n{preview}\n\n请尽快前往12306官网下单。")
-            self._send_notifications_async(alert_lines, title="12306到票提醒")
+            preview = "\n".join(all_lines[:8])
+            if ticket_lines and candidate_lines:
+                title = "有票+候补提醒"
+            elif ticket_lines:
+                title = "有票提醒"
+            else:
+                title = "候补提醒"
+            messagebox.showinfo(title, f"发现可用车次：\n{preview}\n\n请尽快前往12306官网下单。")
+            self._send_notifications_async(all_lines, title=f"12306{title}")
 
         now = datetime.now().strftime("%H:%M:%S")
+        reminder_text = ""
+        if ticket_lines or candidate_lines:
+            reminder_text = f" | 新提醒 有票{len(ticket_lines)} 候补{len(candidate_lines)}"
         if errors:
             short_err = "；".join(errors[:2])
-            self.status_var.set(f"查询完成：{len(filtered)} 条（失败{len(errors)}条，{now}）{short_err}")
+            self.status_var.set(f"查询完成：{len(filtered)} 条（失败{len(errors)}条，{now}）{short_err}{reminder_text}")
         else:
-            self.status_var.set(f"查询完成：{len(filtered)} 条（{now}）")
+            self.status_var.set(f"查询完成：{len(filtered)} 条（{now}）{reminder_text}")
 
         self.schedule_next()
 
@@ -424,6 +494,7 @@ class App:
         return out
 
     def _render_rows(self, rows: List[DisplayRow]) -> None:
+        self.result_row_map.clear()
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
 
@@ -445,11 +516,13 @@ class App:
                 row.seats.get("硬座", "--"),
                 row.seats.get("无座", "--"),
             )
-            self.result_tree.insert("", tk.END, values=values)
+            item_id = self.result_tree.insert("", tk.END, values=values)
+            self.result_row_map[item_id] = item
 
-    def _collect_new_alerts(self, rows: List[DisplayRow]) -> List[str]:
+    def _collect_new_alerts(self, rows: List[DisplayRow]) -> Tuple[List[str], List[str]]:
         seat = self.seat_var.get()
-        lines: List[str] = []
+        ticket_lines: List[str] = []
+        candidate_lines: List[str] = []
 
         for item in rows:
             route = item.route
@@ -459,13 +532,18 @@ class App:
                 value = row.seats.get(seat_name, "--")
                 if not has_ticket(value):
                     continue
-                key = f"{route.key()}:{row.train_no}:{seat_name}"
+                alert_type = "candidate" if is_candidate_ticket(value) else "ticket"
+                key = f"{route.key()}:{row.train_no}:{seat_name}:{alert_type}"
                 if key in self.alerted_keys:
                     continue
                 self.alerted_keys.add(key)
-                lines.append(f"[{route.train_date} {route.from_station}->{route.to_station}] {row.train_no} {seat_name}：{value}")
+                content = f"[{route.train_date} {route.from_station}->{route.to_station}] {row.train_no} {seat_name}：{value}"
+                if is_candidate_ticket(value):
+                    candidate_lines.append(f"[候补] {content}")
+                else:
+                    ticket_lines.append(f"[有票] {content}")
 
-        return lines
+        return ticket_lines, candidate_lines
 
     def _get_routes_for_query(self) -> List[RouteItem]:
         if self.routes:
