@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+import random
+import time
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -26,6 +28,20 @@ class TicketRow:
     duration: str
     bookable: bool
     seats: Dict[str, str]
+
+
+@dataclass
+class RetryPolicy:
+    attempts: int = 3
+    base_delay_sec: float = 0.6
+    max_delay_sec: float = 4.0
+    timeout_sec: float = 10.0
+
+
+class QueryRequestError(RuntimeError):
+    def __init__(self, category: str, message: str) -> None:
+        super().__init__(message)
+        self.category = category
 
 
 class TicketQueryClient:
@@ -104,16 +120,43 @@ class TicketQueryClient:
             return "--"
         return str(raw)
 
+    @staticmethod
+    def classify_error(exc: Exception) -> str:
+        text = str(exc)
+        low = text.lower()
+        if isinstance(exc, requests.Timeout) or "timed out" in low:
+            return "超时"
+        if isinstance(exc, requests.ConnectionError) or "failed to connect" in low:
+            return "网络"
+        if "风控" in text or "error.html" in low:
+            return "风控"
+        if "未找到站名" in text or "未找到精确站名" in text or "车站不能为空" in text:
+            return "参数"
+        if "json" in low or "接口" in text:
+            return "接口"
+        return "未知"
+
+    @staticmethod
+    def _build_backoff(policy: RetryPolicy, attempt: int) -> float:
+        delay = min(policy.max_delay_sec, policy.base_delay_sec * (2 ** attempt))
+        return delay + random.uniform(0, max(0.15, policy.base_delay_sec * 0.35))
+
     def query(
         self,
         train_date: str,
         from_station: str,
         to_station: str,
         purpose_codes: str = "ADULT",
+        retry_policy: Optional[RetryPolicy] = None,
     ) -> List[TicketRow]:
+        policy = retry_policy or RetryPolicy()
         self.warm_up()
-        from_code = self.resolve_station_code(from_station)
-        to_code = self.resolve_station_code(to_station)
+        try:
+            from_code = self.resolve_station_code(from_station)
+            to_code = self.resolve_station_code(to_station)
+        except Exception as exc:  # noqa: BLE001
+            category = self.classify_error(exc)
+            raise QueryRequestError(category, f"查询失败：{exc}") from exc
 
         params = {
             "leftTicketDTO.train_date": train_date,
@@ -124,14 +167,14 @@ class TicketQueryClient:
 
         payload = None
         last_error: Optional[Exception] = None
-        for _attempt in range(2):
+        for attempt in range(max(1, int(policy.attempts))):
             for endpoint in QUERY_ENDPOINTS:
                 try:
-                    resp = self.session.get(endpoint, params=params, timeout=10)
+                    resp = self.session.get(endpoint, params=params, timeout=policy.timeout_sec)
                     resp.raise_for_status()
                     text_head = resp.text.lstrip()[:32]
                     if "error.html" in resp.url or text_head.startswith("<!DOCTYPE html"):
-                        raise RuntimeError("12306接口返回页面，可能触发了临时风控")
+                        raise QueryRequestError("风控", "12306接口返回页面，可能触发了临时风控")
                     data = resp.json()
                     ok = data.get("status") is True or data.get("httpstatus") == 200
                     if ok and data.get("data") is not None:
@@ -143,12 +186,18 @@ class TicketQueryClient:
                 break
             # Try refreshing cookies once when API returns HTML/error pages.
             self._warmed_up = False
-            self.warm_up()
+            try:
+                self.warm_up()
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+            if attempt < max(1, int(policy.attempts)) - 1:
+                time.sleep(self._build_backoff(policy, attempt))
 
         if payload is None:
             if last_error:
-                raise RuntimeError(f"查询失败：{last_error}") from last_error
-            raise RuntimeError("查询失败：12306接口暂时不可用")
+                category = self.classify_error(last_error)
+                raise QueryRequestError(category, f"查询失败：{last_error}") from last_error
+            raise QueryRequestError("接口", "查询失败：12306接口暂时不可用")
 
         code_to_name = dict(self._code_to_name)
         code_to_name.update(payload.get("map", {}))

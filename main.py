@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import re
 import threading
 import tkinter as tk
 import webbrowser
@@ -9,11 +10,11 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 import time
 from tkinter import messagebox, ttk
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from app_config import AppSettings, EmailConfig, RouteItem, WeComConfig, load_settings, save_settings
 from notifier import NotificationSender
-from ticket_client import TicketQueryClient, TicketRow
+from ticket_client import QueryRequestError, RetryPolicy, TicketQueryClient, TicketRow
 
 SEAT_OPTIONS = ["任意", "商务座", "一等座", "二等座", "软卧", "硬卧", "硬座", "无座"]
 
@@ -40,6 +41,27 @@ def is_candidate_ticket(value: str) -> bool:
     return bool(text) and "候补" in text
 
 
+def extract_cookie_expiration(cookie_text: str) -> Optional[datetime]:
+    text = (cookie_text or "").strip()
+    if not text:
+        return None
+    match = re.search(r"RAIL_EXPIRATION=([^;\\s]+)", text)
+    if not match:
+        return None
+    raw = match.group(1).strip()
+    if not raw.isdigit():
+        return None
+    value = int(raw)
+    if value > 10**12:
+        ts = value / 1000.0
+    else:
+        ts = float(value)
+    try:
+        return datetime.fromtimestamp(ts)
+    except (ValueError, OSError):
+        return None
+
+
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -54,6 +76,7 @@ class App:
         self.after_job: str | None = None
         self.alerted_keys: set[str] = set()
         self.result_row_map: Dict[str, DisplayRow] = {}
+        self.error_stats: Dict[str, Dict[str, str]] = {}
 
         self.settings_path = Path(__file__).with_name("settings.json")
         self.settings = load_settings(self.settings_path)
@@ -62,10 +85,17 @@ class App:
         self.route_date_var = tk.StringVar(value=(date.today() + timedelta(days=1)).strftime("%Y-%m-%d"))
         self.route_from_var = tk.StringVar(value="")
         self.route_to_var = tk.StringVar(value="")
+        self.route_group_var = tk.StringVar(value="默认")
+        self.route_enabled_var = tk.BooleanVar(value=True)
+        self.batch_group_var = tk.StringVar(value="默认")
 
         self.interval_var = tk.IntVar(value=max(2, self.settings.interval_sec))
         self.train_filter_var = tk.StringVar(value=self.settings.train_filter)
         self.seat_var = tk.StringVar(value=self.settings.seat_filter if self.settings.seat_filter in SEAT_OPTIONS else "任意")
+        self.retry_attempts_var = tk.IntVar(value=max(1, self.settings.retry_attempts))
+        self.retry_base_delay_var = tk.DoubleVar(value=max(0.1, self.settings.retry_base_delay_sec))
+        self.retry_max_delay_var = tk.DoubleVar(value=max(0.2, self.settings.retry_max_delay_sec))
+        self.request_timeout_var = tk.DoubleVar(value=max(2.0, self.settings.request_timeout_sec))
         self.status_var = tk.StringVar(value="就绪")
         self.route_count_var = tk.StringVar(value="线路数：0")
 
@@ -82,9 +112,12 @@ class App:
         self.wecom_webhook_var = tk.StringVar(value=self.settings.wecom.webhook)
         self.cookie_var = tk.StringVar()
         self.login_state_var = tk.StringVar(value="登录状态：未检测")
+        self.cookie_expire_var = tk.StringVar(value="Cookie到期：未提供")
 
         self._build_ui()
         self._refresh_route_tree()
+        self._update_cookie_expiration_tip()
+        self.cookie_var.trace_add("write", lambda *_: self._update_cookie_expiration_tip())
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -118,8 +151,26 @@ class App:
             row=0, column=5, pady=4
         )
 
+        ttk.Label(ctrl, text="重试次数").grid(row=1, column=0, sticky=tk.W, padx=(0, 4), pady=4)
+        ttk.Spinbox(ctrl, from_=1, to=8, textvariable=self.retry_attempts_var, width=8).grid(row=1, column=1, pady=4)
+
+        ttk.Label(ctrl, text="基础退避(s)").grid(row=1, column=2, sticky=tk.W, padx=(14, 4), pady=4)
+        ttk.Spinbox(ctrl, from_=0.1, to=5.0, increment=0.1, textvariable=self.retry_base_delay_var, width=8).grid(
+            row=1, column=3, pady=4
+        )
+
+        ttk.Label(ctrl, text="最大退避(s)").grid(row=1, column=4, sticky=tk.W, padx=(14, 4), pady=4)
+        ttk.Spinbox(ctrl, from_=0.2, to=15.0, increment=0.2, textvariable=self.retry_max_delay_var, width=8).grid(
+            row=1, column=5, pady=4
+        )
+
+        ttk.Label(ctrl, text="请求超时(s)").grid(row=1, column=6, sticky=tk.W, padx=(14, 4), pady=4)
+        ttk.Spinbox(ctrl, from_=2.0, to=30.0, increment=0.5, textvariable=self.request_timeout_var, width=8).grid(
+            row=1, column=7, pady=4
+        )
+
         btns = ttk.Frame(ctrl)
-        btns.grid(row=0, column=6, padx=(16, 0), sticky=tk.E)
+        btns.grid(row=0, column=8, rowspan=2, padx=(16, 0), sticky=tk.E)
         self.query_btn = ttk.Button(btns, text="立即查询", command=self.trigger_query)
         self.query_btn.pack(side=tk.LEFT, padx=3)
         self.start_btn = ttk.Button(btns, text="开始监控", command=self.start_monitor)
@@ -142,27 +193,56 @@ class App:
         ttk.Label(routes_frame, text="到达站").grid(row=0, column=4, sticky=tk.W, padx=(12, 4), pady=4)
         ttk.Entry(routes_frame, textvariable=self.route_to_var, width=14).grid(row=0, column=5, pady=4)
 
-        ttk.Button(routes_frame, text="添加线路", command=self.add_route).grid(row=0, column=6, padx=(12, 4), pady=4)
-        ttk.Button(routes_frame, text="删除选中", command=self.remove_selected_routes).grid(row=0, column=7, padx=4, pady=4)
-        ttk.Button(routes_frame, text="清空线路", command=self.clear_routes).grid(row=0, column=8, padx=4, pady=4)
-        ttk.Label(routes_frame, textvariable=self.route_count_var).grid(row=0, column=9, padx=(10, 0), sticky=tk.E)
+        ttk.Label(routes_frame, text="分组").grid(row=0, column=6, sticky=tk.W, padx=(12, 4), pady=4)
+        ttk.Entry(routes_frame, textvariable=self.route_group_var, width=10).grid(row=0, column=7, pady=4)
+        ttk.Checkbutton(routes_frame, text="启用", variable=self.route_enabled_var).grid(row=0, column=8, pady=4, padx=4)
+
+        ttk.Button(routes_frame, text="添加线路", command=self.add_route).grid(row=0, column=9, padx=(8, 4), pady=4)
+        ttk.Button(routes_frame, text="删除选中", command=self.remove_selected_routes).grid(row=0, column=10, padx=4, pady=4)
+        ttk.Button(routes_frame, text="清空线路", command=self.clear_routes).grid(row=0, column=11, padx=4, pady=4)
+        ttk.Label(routes_frame, text="批量分组").grid(row=1, column=0, sticky=tk.W, padx=(0, 4), pady=4)
+        ttk.Entry(routes_frame, textvariable=self.batch_group_var, width=12).grid(row=1, column=1, pady=4)
+        ttk.Button(routes_frame, text="按分组启用", command=self.enable_routes_by_group).grid(row=1, column=2, padx=4, pady=4)
+        ttk.Button(routes_frame, text="按分组停用", command=self.disable_routes_by_group).grid(row=1, column=3, padx=4, pady=4)
+        ttk.Button(routes_frame, text="启用选中", command=self.enable_selected_routes).grid(row=1, column=4, padx=4, pady=4)
+        ttk.Button(routes_frame, text="停用选中", command=self.disable_selected_routes).grid(row=1, column=5, padx=4, pady=4)
+        ttk.Label(routes_frame, textvariable=self.route_count_var).grid(row=1, column=11, padx=(10, 0), sticky=tk.E)
 
         route_table_frame = ttk.Frame(routes_frame)
-        route_table_frame.grid(row=1, column=0, columnspan=10, sticky=tk.EW, pady=(6, 0))
-        routes_frame.columnconfigure(9, weight=1)
+        route_table_frame.grid(row=2, column=0, columnspan=12, sticky=tk.EW, pady=(6, 0))
+        routes_frame.columnconfigure(11, weight=1)
 
-        self.route_tree = ttk.Treeview(route_table_frame, columns=("date", "from", "to"), show="headings", height=4)
+        self.route_tree = ttk.Treeview(route_table_frame, columns=("date", "from", "to", "group", "enabled"), show="headings", height=5)
         self.route_tree.heading("date", text="日期")
         self.route_tree.heading("from", text="出发站")
         self.route_tree.heading("to", text="到达站")
+        self.route_tree.heading("group", text="分组")
+        self.route_tree.heading("enabled", text="状态")
         self.route_tree.column("date", width=120, anchor=tk.CENTER)
         self.route_tree.column("from", width=140, anchor=tk.CENTER)
         self.route_tree.column("to", width=140, anchor=tk.CENTER)
+        self.route_tree.column("group", width=100, anchor=tk.CENTER)
+        self.route_tree.column("enabled", width=80, anchor=tk.CENTER)
 
         route_scroll = ttk.Scrollbar(route_table_frame, orient=tk.VERTICAL, command=self.route_tree.yview)
         self.route_tree.configure(yscrollcommand=route_scroll.set)
         self.route_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
         route_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        error_frame = ttk.LabelFrame(parent, text="错误分类面板", padding=8)
+        error_frame.pack(fill=tk.X, padx=4, pady=(0, 4))
+        ttk.Button(error_frame, text="清空统计", command=self.clear_error_stats).pack(anchor=tk.E, pady=(0, 4))
+        self.error_tree = ttk.Treeview(error_frame, columns=("category", "count", "last"), show="headings", height=4)
+        self.error_tree.heading("category", text="分类")
+        self.error_tree.heading("count", text="次数")
+        self.error_tree.heading("last", text="最近错误")
+        self.error_tree.column("category", width=110, anchor=tk.CENTER)
+        self.error_tree.column("count", width=80, anchor=tk.CENTER)
+        self.error_tree.column("last", width=900, anchor=tk.W)
+        err_scroll = ttk.Scrollbar(error_frame, orient=tk.VERTICAL, command=self.error_tree.yview)
+        self.error_tree.configure(yscrollcommand=err_scroll.set)
+        self.error_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        err_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         tip = ttk.Label(parent, text="说明：仅做余票查询/候补提醒与跳转，不自动下单。", padding=(8, 4, 8, 0))
         tip.pack(anchor=tk.W)
@@ -273,6 +353,7 @@ class App:
         ttk.Button(login_frame, text="检测登录状态", command=self.check_login_status).grid(row=0, column=2, padx=6, pady=3)
         ttk.Button(login_frame, text="清空Cookie", command=self.clear_cookie_text).grid(row=0, column=3, padx=4, pady=3)
         ttk.Label(login_frame, textvariable=self.login_state_var).grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=(2, 0))
+        ttk.Label(login_frame, textvariable=self.cookie_expire_var).grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(2, 0))
 
         action_frame = ttk.Frame(parent)
         action_frame.pack(fill=tk.X, padx=6, pady=(4, 6))
@@ -306,14 +387,28 @@ class App:
         self.routes = unique
 
         for route in self.routes:
-            self.route_tree.insert("", tk.END, iid=route.key(), values=(route.train_date, route.from_station, route.to_station))
+            self.route_tree.insert(
+                "",
+                tk.END,
+                iid=route.key(),
+                values=(
+                    route.train_date,
+                    route.from_station,
+                    route.to_station,
+                    route.group,
+                    "启用" if route.enabled else "停用",
+                ),
+            )
 
-        self.route_count_var.set(f"线路数：{len(self.routes)}")
+        enabled_count = len([route for route in self.routes if route.enabled])
+        self.route_count_var.set(f"线路数：{len(self.routes)}（启用 {enabled_count}）")
 
     def add_route(self) -> None:
         train_date = self.route_date_var.get().strip()
         from_station = self.route_from_var.get().strip()
         to_station = self.route_to_var.get().strip()
+        group = self.route_group_var.get().strip() or "默认"
+        enabled = self.route_enabled_var.get()
 
         if not train_date or not from_station or not to_station:
             messagebox.showwarning("提示", "请填写完整的日期、出发站和到达站")
@@ -323,12 +418,19 @@ class App:
             messagebox.showwarning("提示", "日期格式应为 YYYY-MM-DD")
             return
 
-        route = RouteItem(train_date=train_date, from_station=from_station, to_station=to_station)
+        route = RouteItem(
+            train_date=train_date,
+            from_station=from_station,
+            to_station=to_station,
+            group=group,
+            enabled=enabled,
+        )
         if route.key() in {item.key() for item in self.routes}:
             messagebox.showinfo("提示", "该线路已存在")
             return
 
         self.routes.append(route)
+        self.batch_group_var.set(group)
         self._refresh_route_tree()
 
     def remove_selected_routes(self) -> None:
@@ -339,6 +441,44 @@ class App:
         selected_keys = set(selected)
         self.routes = [route for route in self.routes if route.key() not in selected_keys]
         self._refresh_route_tree()
+
+    def enable_selected_routes(self) -> None:
+        self._set_selected_routes_enabled(True)
+
+    def disable_selected_routes(self) -> None:
+        self._set_selected_routes_enabled(False)
+
+    def _set_selected_routes_enabled(self, enabled: bool) -> None:
+        selected = set(self.route_tree.selection())
+        if not selected:
+            messagebox.showinfo("提示", "请先选择要操作的线路")
+            return
+        changed = 0
+        for route in self.routes:
+            if route.key() in selected and route.enabled != enabled:
+                route.enabled = enabled
+                changed += 1
+        self._refresh_route_tree()
+        self.status_var.set(f"已{('启用' if enabled else '停用')}选中线路 {changed} 条")
+
+    def enable_routes_by_group(self) -> None:
+        self._set_routes_by_group_enabled(True)
+
+    def disable_routes_by_group(self) -> None:
+        self._set_routes_by_group_enabled(False)
+
+    def _set_routes_by_group_enabled(self, enabled: bool) -> None:
+        group = self.batch_group_var.get().strip()
+        if not group:
+            messagebox.showwarning("提示", "请先填写批量分组名")
+            return
+        changed = 0
+        for route in self.routes:
+            if route.group == group and route.enabled != enabled:
+                route.enabled = enabled
+                changed += 1
+        self._refresh_route_tree()
+        self.status_var.set(f"分组[{group}]已{('启用' if enabled else '停用')} {changed} 条线路")
 
     def clear_routes(self) -> None:
         if not self.routes:
@@ -380,21 +520,60 @@ class App:
         self.cookie_var.set("")
         self.client.clear_cookie_header()
         self.login_state_var.set("登录状态：未检测")
+        self.cookie_expire_var.set("Cookie到期：未提供")
         self.status_var.set("已清空Cookie")
+
+    def _update_cookie_expiration_tip(self) -> None:
+        raw_cookie = self.cookie_var.get().strip()
+        if not raw_cookie:
+            self.cookie_expire_var.set("Cookie到期：未提供")
+            return
+        dt = extract_cookie_expiration(raw_cookie)
+        if not dt:
+            self.cookie_expire_var.set("Cookie到期：未识别 RAIL_EXPIRATION")
+            return
+        now = datetime.now()
+        remain = dt - now
+        if remain.total_seconds() <= 0:
+            self.cookie_expire_var.set(f"Cookie到期：已过期（{dt.strftime('%Y-%m-%d %H:%M:%S')}）")
+            return
+        hours = remain.total_seconds() / 3600
+        self.cookie_expire_var.set(
+            f"Cookie到期：{dt.strftime('%Y-%m-%d %H:%M:%S')}（剩余约 {hours:.1f} 小时）"
+        )
+
+    def _cookie_expire_warning_text(self) -> Optional[str]:
+        dt = extract_cookie_expiration(self.cookie_var.get())
+        if not dt:
+            return None
+        remain = dt - datetime.now()
+        if remain.total_seconds() <= 0:
+            return "检测到 Cookie 已过期，建议重新获取后再监控。"
+        if remain.total_seconds() <= 24 * 3600:
+            hours = remain.total_seconds() / 3600
+            return f"Cookie 将在约 {hours:.1f} 小时后过期，建议提前更新。"
+        return None
 
     def check_login_status(self) -> None:
         cookie = self.cookie_var.get().strip()
         self.client.set_cookie_header(cookie)
+        self._update_cookie_expiration_tip()
         ok, message = self.client.check_login_status()
+        expire_warn = self._cookie_expire_warning_text()
         if ok:
             self.login_state_var.set(f"登录状态：已登录（{message}）")
             self.status_var.set("12306登录状态检测：已登录")
+            if expire_warn:
+                messagebox.showwarning("Cookie即将到期", expire_warn)
         else:
             self.login_state_var.set(f"登录状态：未登录/无效（{message}）")
             self.status_var.set("12306登录状态检测：未登录或Cookie无效")
+            if expire_warn:
+                messagebox.showwarning("Cookie状态提醒", expire_warn)
 
     def start_monitor(self) -> None:
         if not self._get_routes_for_query():
+            messagebox.showwarning("提示", "没有可用线路（请添加并启用至少一条线路）")
             return
         self.monitoring = True
         self.alerted_keys.clear()
@@ -424,7 +603,7 @@ class App:
 
         routes = self._get_routes_for_query()
         if not routes:
-            messagebox.showwarning("提示", "请先添加至少一条线路，或填写线路输入框后再查询")
+            messagebox.showwarning("提示", "请先添加并启用至少一条线路，或填写线路输入框后再查询")
             return
 
         self.querying = True
@@ -435,20 +614,30 @@ class App:
 
     def _query_in_thread(self, routes: List[RouteItem]) -> None:
         rows: List[DisplayRow] = []
-        errors: List[str] = []
+        errors: List[Tuple[str, str, str]] = []
+        policy = self._build_retry_policy()
 
         for index, route in enumerate(routes):
             try:
-                route_rows = self.client.query(route.train_date, route.from_station, route.to_station)
+                route_rows = self.client.query(
+                    route.train_date,
+                    route.from_station,
+                    route.to_station,
+                    retry_policy=policy,
+                )
                 rows.extend([DisplayRow(route=route, row=item) for item in route_rows])
+            except QueryRequestError as exc:
+                route_text = f"[{route.group}] {route.train_date} {route.from_station}->{route.to_station}"
+                errors.append((route_text, exc.category, str(exc)))
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"[{route.train_date} {route.from_station}->{route.to_station}] {exc}")
+                route_text = f"[{route.group}] {route.train_date} {route.from_station}->{route.to_station}"
+                errors.append((route_text, "未知", str(exc)))
             if index < len(routes) - 1:
                 time.sleep(random.uniform(0.4, 1.0))
 
         self.root.after(0, lambda: self.on_query_done(rows, errors))
 
-    def on_query_done(self, rows: List[DisplayRow], errors: List[str]) -> None:
+    def on_query_done(self, rows: List[DisplayRow], errors: List[Tuple[str, str, str]]) -> None:
         self.querying = False
         self.query_btn.config(state=tk.NORMAL)
 
@@ -473,12 +662,51 @@ class App:
         if ticket_lines or candidate_lines:
             reminder_text = f" | 新提醒 有票{len(ticket_lines)} 候补{len(candidate_lines)}"
         if errors:
-            short_err = "；".join(errors[:2])
+            self._record_errors(errors)
+            short_err = "；".join([f"{item[0]} {item[2]}" for item in errors[:2]])
             self.status_var.set(f"查询完成：{len(filtered)} 条（失败{len(errors)}条，{now}）{short_err}{reminder_text}")
         else:
             self.status_var.set(f"查询完成：{len(filtered)} 条（{now}）{reminder_text}")
 
         self.schedule_next()
+
+    def _build_retry_policy(self) -> RetryPolicy:
+        attempts = max(1, int(self.retry_attempts_var.get()))
+        base_delay = max(0.1, float(self.retry_base_delay_var.get()))
+        max_delay = max(base_delay, float(self.retry_max_delay_var.get()))
+        timeout_sec = max(2.0, float(self.request_timeout_var.get()))
+        return RetryPolicy(
+            attempts=attempts,
+            base_delay_sec=base_delay,
+            max_delay_sec=max_delay,
+            timeout_sec=timeout_sec,
+        )
+
+    def _record_errors(self, errors: List[Tuple[str, str, str]]) -> None:
+        for route_text, category, msg in errors:
+            key = category or "未知"
+            item = self.error_stats.get(key, {"count": "0", "last": ""})
+            count = int(item.get("count", "0")) + 1
+            item["count"] = str(count)
+            item["last"] = f"{route_text} {msg}"
+            self.error_stats[key] = item
+        self._render_error_stats()
+
+    def _render_error_stats(self) -> None:
+        for iid in self.error_tree.get_children():
+            self.error_tree.delete(iid)
+        for category in sorted(self.error_stats.keys()):
+            item = self.error_stats[category]
+            self.error_tree.insert(
+                "",
+                tk.END,
+                values=(category, item.get("count", "0"), item.get("last", "")),
+            )
+
+    def clear_error_stats(self) -> None:
+        self.error_stats = {}
+        self._render_error_stats()
+        self.status_var.set("已清空错误分类统计")
 
     def _apply_filters(self, rows: List[DisplayRow]) -> List[DisplayRow]:
         train_kw = self.train_filter_var.get().strip().upper()
@@ -547,13 +775,21 @@ class App:
 
     def _get_routes_for_query(self) -> List[RouteItem]:
         if self.routes:
-            return list(self.routes)
+            return [route for route in self.routes if route.enabled]
 
         train_date = self.route_date_var.get().strip()
         from_station = self.route_from_var.get().strip()
         to_station = self.route_to_var.get().strip()
         if train_date and from_station and to_station and self._valid_date(train_date):
-            return [RouteItem(train_date=train_date, from_station=from_station, to_station=to_station)]
+            return [
+                RouteItem(
+                    train_date=train_date,
+                    from_station=from_station,
+                    to_station=to_station,
+                    group=self.route_group_var.get().strip() or "默认",
+                    enabled=True,
+                )
+            ]
         return []
 
     def _valid_date(self, text: str) -> bool:
@@ -622,6 +858,10 @@ class App:
             train_filter=self.train_filter_var.get().strip(),
             seat_filter=self.seat_var.get().strip(),
             routes=list(self.routes),
+            retry_attempts=max(1, int(self.retry_attempts_var.get())),
+            retry_base_delay_sec=max(0.1, float(self.retry_base_delay_var.get())),
+            retry_max_delay_sec=max(0.2, float(self.retry_max_delay_var.get())),
+            request_timeout_sec=max(2.0, float(self.request_timeout_var.get())),
             email=self._build_email_config(),
             wecom=self._build_wecom_config(),
         )

@@ -11,9 +11,11 @@ class RouteItem:
     train_date: str
     from_station: str
     to_station: str
+    group: str = "默认"
+    enabled: bool = True
 
     def key(self) -> str:
-        return f"{self.train_date}|{self.from_station}|{self.to_station}"
+        return f"{self.train_date}|{self.from_station}|{self.to_station}|{self.group}"
 
 
 @dataclass
@@ -40,6 +42,10 @@ class AppSettings:
     train_filter: str = ""
     seat_filter: str = "任意"
     routes: List[RouteItem] = field(default_factory=list)
+    retry_attempts: int = 3
+    retry_base_delay_sec: float = 0.6
+    retry_max_delay_sec: float = 4.0
+    request_timeout_sec: float = 10.0
     email: EmailConfig = field(default_factory=EmailConfig)
     wecom: WeComConfig = field(default_factory=WeComConfig)
 
@@ -61,6 +67,13 @@ def _to_int(value: Any, default: int) -> int:
         return default
 
 
+def _to_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def load_settings(path: Path) -> AppSettings:
     if not path.exists():
         return AppSettings()
@@ -78,8 +91,18 @@ def load_settings(path: Path) -> AppSettings:
         train_date = str(item.get("train_date", "")).strip()
         from_station = str(item.get("from_station", "")).strip()
         to_station = str(item.get("to_station", "")).strip()
+        group = str(item.get("group", "默认")).strip() or "默认"
+        enabled = _to_bool(item.get("enabled"), True)
         if train_date and from_station and to_station:
-            routes.append(RouteItem(train_date=train_date, from_station=from_station, to_station=to_station))
+            routes.append(
+                RouteItem(
+                    train_date=train_date,
+                    from_station=from_station,
+                    to_station=to_station,
+                    group=group,
+                    enabled=enabled,
+                )
+            )
 
     email_raw: Dict[str, Any] = data.get("email", {}) if isinstance(data.get("email", {}), dict) else {}
     wecom_raw: Dict[str, Any] = data.get("wecom", {}) if isinstance(data.get("wecom", {}), dict) else {}
@@ -105,6 +128,10 @@ def load_settings(path: Path) -> AppSettings:
         train_filter=str(data.get("train_filter", "")),
         seat_filter=str(data.get("seat_filter", "任意")),
         routes=routes,
+        retry_attempts=max(1, _to_int(data.get("retry_attempts"), 3)),
+        retry_base_delay_sec=max(0.1, _to_float(data.get("retry_base_delay_sec"), 0.6)),
+        retry_max_delay_sec=max(0.2, _to_float(data.get("retry_max_delay_sec"), 4.0)),
+        request_timeout_sec=max(2.0, _to_float(data.get("request_timeout_sec"), 10.0)),
         email=email,
         wecom=wecom,
     )
