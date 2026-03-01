@@ -1,0 +1,20 @@
+{
+  "interval_sec": 5,
+  "train_filter": "",
+  "seat_filter": "任意",
+  "routes": [],
+  "email": {
+    "enabled": false,
+    "smtp_host": "smtp.qq.com",
+    "smtp_port": 465,
+    "username": "",
+    "password": "",
+    "from_addr": "",
+    "to_addrs": "",
+    "use_ssl": true
+  },
+  "wecom": {
+    "enabled": false,
+    "webhook": ""
+  }
+}
