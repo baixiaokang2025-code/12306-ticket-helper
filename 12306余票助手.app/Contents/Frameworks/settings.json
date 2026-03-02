@@ -1,6 +1,6 @@
 {
   "interval_sec": 5,
-  "train_filter": "d",
+  "train_filter": "",
   "seat_filter": "任意",
   "routes": [],
   "email": {
@@ -11,7 +11,7 @@
     "password": "",
     "from_addr": "",
     "to_addrs": "",
-    "use_ssl": false
+    "use_ssl": true
   },
   "wecom": {
     "enabled": false,
