@@ -98,6 +98,8 @@ class App:
         self.transfer_row_map: Dict[str, TransferPlan] = {}
         self.last_direct_recommend: Optional[DisplayRow] = None
         self.last_transfer_recommend: Optional[TransferPlan] = None
+        self.last_candidate_direct_recommend: Optional[DisplayRow] = None
+        self.last_candidate_transfer_recommend: Optional[TransferPlan] = None
         self.error_stats: Dict[str, Dict[str, str]] = {}
 
         self.settings_path = Path(__file__).with_name("settings.json")
@@ -232,6 +234,9 @@ class App:
         ttk.Button(btns, text="打开推荐直达", command=self.open_recommended_direct_page).pack(side=tk.LEFT, padx=3)
         ttk.Button(btns, text="打开推荐中转首段", command=self.open_recommended_transfer_first_leg).pack(side=tk.LEFT, padx=3)
         ttk.Button(btns, text="打开推荐中转次段", command=self.open_recommended_transfer_second_leg).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btns, text="打开候补直达", command=self.open_recommended_candidate_direct_page).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btns, text="打开候补中转首段", command=self.open_recommended_candidate_transfer_first_leg).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btns, text="打开候补中转次段", command=self.open_recommended_candidate_transfer_second_leg).pack(side=tk.LEFT, padx=3)
         ttk.Button(btns, text="保存设置", command=self.save_current_settings).pack(side=tk.LEFT, padx=3)
 
         routes_frame = ttk.LabelFrame(parent, text="线路管理（支持多线路）", padding=10)
@@ -356,6 +361,7 @@ class App:
 
         result_scroll_y = ttk.Scrollbar(result_frame, orient=tk.VERTICAL, command=self.result_tree.yview)
         self.result_tree.configure(yscrollcommand=result_scroll_y.set)
+        self.result_tree.tag_configure("candidate", background="#fff0b3")
 
         self.result_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         result_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
@@ -397,6 +403,7 @@ class App:
 
         transfer_scroll_y = ttk.Scrollbar(transfer_frame, orient=tk.VERTICAL, command=self.transfer_tree.yview)
         self.transfer_tree.configure(yscrollcommand=transfer_scroll_y.set)
+        self.transfer_tree.tag_configure("candidate", background="#ffe9a8")
         self.transfer_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         transfer_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
 
@@ -590,17 +597,35 @@ class App:
             return
         self._open_display_row_order_page(self.last_direct_recommend, prefix="推荐直达")
 
+    def open_recommended_candidate_direct_page(self) -> None:
+        if not self.last_candidate_direct_recommend:
+            messagebox.showinfo("提示", "当前没有候补直达推荐，请先查询并等待候补命中")
+            return
+        self._open_display_row_order_page(self.last_candidate_direct_recommend, prefix="候补直达")
+
     def open_recommended_transfer_first_leg(self) -> None:
         if not self.last_transfer_recommend:
             messagebox.showinfo("提示", "当前没有推荐的中转方案，请先查询并等待命中")
             return
         self._open_transfer_leg_page(self.last_transfer_recommend, is_first_leg=True, prefix="推荐中转")
 
+    def open_recommended_candidate_transfer_first_leg(self) -> None:
+        if not self.last_candidate_transfer_recommend:
+            messagebox.showinfo("提示", "当前没有候补中转推荐，请先查询并等待候补命中")
+            return
+        self._open_transfer_leg_page(self.last_candidate_transfer_recommend, is_first_leg=True, prefix="候补中转")
+
     def open_recommended_transfer_second_leg(self) -> None:
         if not self.last_transfer_recommend:
             messagebox.showinfo("提示", "当前没有推荐的中转方案，请先查询并等待命中")
             return
         self._open_transfer_leg_page(self.last_transfer_recommend, is_first_leg=False, prefix="推荐中转")
+
+    def open_recommended_candidate_transfer_second_leg(self) -> None:
+        if not self.last_candidate_transfer_recommend:
+            messagebox.showinfo("提示", "当前没有候补中转推荐，请先查询并等待候补命中")
+            return
+        self._open_transfer_leg_page(self.last_candidate_transfer_recommend, is_first_leg=False, prefix="候补中转")
 
     def open_selected_transfer_first_leg(self) -> None:
         self._open_selected_transfer_leg(is_first_leg=True)
@@ -806,22 +831,27 @@ class App:
         self.query_btn.config(state=tk.NORMAL)
 
         filtered = self._apply_filters(rows)
-        self._render_rows(filtered)
-        self._render_transfer_plans(transfer_plans)
-        self.last_direct_recommend = self._pick_direct_recommend(filtered)
-        self.last_transfer_recommend = transfer_plans[0] if transfer_plans else None
-        ticket_lines, candidate_lines = self._collect_new_alerts(filtered)
-        transfer_lines = self._collect_transfer_alerts(transfer_plans)
+        sorted_filtered = self._sort_direct_rows(filtered)
+        sorted_transfer = self._sort_transfer_plans(transfer_plans)
+        self._render_rows(sorted_filtered)
+        self._render_transfer_plans(sorted_transfer)
+        self.last_direct_recommend = self._pick_direct_recommend(sorted_filtered)
+        self.last_transfer_recommend = sorted_transfer[0] if sorted_transfer else None
+        self.last_candidate_direct_recommend = self._pick_candidate_direct_recommend(sorted_filtered)
+        self.last_candidate_transfer_recommend = self._pick_candidate_transfer_recommend(sorted_transfer)
+        ticket_lines, candidate_lines = self._collect_new_alerts(sorted_filtered)
+        transfer_lines, transfer_candidate_lines = self._collect_transfer_alerts(sorted_transfer)
+        candidate_all_lines = candidate_lines + transfer_candidate_lines
         all_lines = ticket_lines + candidate_lines + transfer_lines
         if all_lines:
-            self.root.bell()
+            self._ring_hit_alert(is_candidate=bool(candidate_all_lines))
             preview = "\n".join(all_lines[:8])
-            if ticket_lines and candidate_lines:
-                title = "有票+候补提醒"
+            if candidate_all_lines and ticket_lines:
+                title = "候补专属提醒（含有票）"
+            elif candidate_all_lines:
+                title = "候补专属提醒"
             elif ticket_lines:
                 title = "有票提醒"
-            elif candidate_lines:
-                title = "候补提醒"
             else:
                 title = "中转提醒"
             countdown_sec = max(5, int(self.assist_countdown_sec_var.get()))
@@ -830,29 +860,41 @@ class App:
                 f"发现可用车次：\n{preview}\n\n"
                 f"建议在 {countdown_sec} 秒内打开推荐下单页并手动提交订单（支付仍需你本人确认）。",
             )
-            self._assist_user_after_hit(all_lines, countdown_sec=countdown_sec)
+            self._assist_user_after_hit(all_lines, candidate_lines=candidate_all_lines, countdown_sec=countdown_sec)
             self._send_notifications_async(all_lines, title=f"12306{title}")
 
         now = datetime.now().strftime("%H:%M:%S")
         reminder_text = ""
         if ticket_lines or candidate_lines:
             reminder_text = f" | 新提醒 有票{len(ticket_lines)} 候补{len(candidate_lines)}"
+        if transfer_candidate_lines:
+            reminder_text += f" 中转候补{len(transfer_candidate_lines)}"
         if transfer_lines:
             reminder_text += f" 中转{len(transfer_lines)}"
         if errors:
             self._record_errors(errors)
             short_err = "；".join([f"{item[0]} {item[2]}" for item in errors[:2]])
-            self.status_var.set(f"查询完成：{len(filtered)} 条（失败{len(errors)}条，{now}）{short_err}{reminder_text}")
+            self.status_var.set(f"查询完成：{len(sorted_filtered)} 条（失败{len(errors)}条，{now}）{short_err}{reminder_text}")
         else:
-            self.status_var.set(f"查询完成：{len(filtered)} 条（{now}）{reminder_text}")
+            self.status_var.set(f"查询完成：{len(sorted_filtered)} 条（{now}）{reminder_text}")
 
         self.schedule_next()
 
-    def _assist_user_after_hit(self, lines: List[str], *, countdown_sec: int) -> None:
+    def _assist_user_after_hit(self, lines: List[str], *, candidate_lines: List[str], countdown_sec: int) -> None:
         if self.copy_alert_var.get():
-            payload = "\n".join(lines[:20])
+            payload = self._build_copy_payload(lines, candidate_lines)
             self._copy_text_to_clipboard(payload)
         self._start_assist_countdown(countdown_sec)
+
+    def _build_copy_payload(self, lines: List[str], candidate_lines: List[str]) -> str:
+        if candidate_lines:
+            tips = [
+                "【候补提交清单】",
+                "请先打开候补推荐页面，再手动提交候补订单（支付需你本人确认）。",
+                "",
+            ]
+            return "\n".join(tips + candidate_lines[:20])
+        return "\n".join(lines[:20])
 
     def _copy_text_to_clipboard(self, text: str) -> None:
         try:
@@ -882,11 +924,42 @@ class App:
         self.assist_countdown_left = left - 1
         self.assist_countdown_job = self.root.after(1000, self._tick_assist_countdown)
 
+    def _ring_hit_alert(self, *, is_candidate: bool) -> None:
+        times = 4 if is_candidate else 1
+        for _ in range(times):
+            self.root.bell()
+
     def _pick_direct_recommend(self, rows: List[DisplayRow]) -> Optional[DisplayRow]:
         for item in rows:
             if self._row_passes_seat_filter(item.row):
                 return item
         return None
+
+    def _pick_candidate_direct_recommend(self, rows: List[DisplayRow]) -> Optional[DisplayRow]:
+        for item in rows:
+            if self._display_row_candidate_score(item) > 0:
+                return item
+        return None
+
+    def _pick_candidate_transfer_recommend(self, plans: List[TransferPlan]) -> Optional[TransferPlan]:
+        for plan in plans:
+            if self._transfer_plan_candidate_score(plan) > 0:
+                return plan
+        return None
+
+    def _sort_direct_rows(self, rows: List[DisplayRow]) -> List[DisplayRow]:
+        return sorted(rows, key=lambda item: (-self._display_row_candidate_score(item), item.row.train_no))
+
+    def _sort_transfer_plans(self, plans: List[TransferPlan]) -> List[TransferPlan]:
+        return sorted(
+            plans,
+            key=lambda item: (
+                -self._transfer_plan_candidate_score(item),
+                item.wait_minutes,
+                -item.seat_score,
+                item.total_minutes,
+            ),
+        )
 
     def _build_retry_policy(self) -> RetryPolicy:
         attempts = max(1, int(self.retry_attempts_var.get()))
@@ -1019,7 +1092,7 @@ class App:
                 )
 
         plans = self._dedupe_transfer_plans(plans)
-        plans.sort(key=lambda item: (-item.seat_score, item.total_minutes, item.wait_minutes))
+        plans = self._sort_transfer_plans(plans)
         return plans[:max_plans]
 
     def _build_transfer_plans_with_second_rows(
@@ -1124,6 +1197,47 @@ class App:
                 return True
         return False
 
+    def _display_row_candidate_score(self, item: DisplayRow) -> int:
+        row = item.row
+        seat = self.seat_var.get()
+        if seat != "任意":
+            value = row.seats.get(seat, "--")
+            return 2 if is_candidate_ticket(value) else 0
+        score = 0
+        for seat_name in SEAT_OPTIONS:
+            if seat_name == "任意":
+                continue
+            value = row.seats.get(seat_name, "--")
+            if is_candidate_ticket(value):
+                score += 1
+        return score
+
+    def _transfer_plan_candidate_score(self, plan: TransferPlan) -> int:
+        seat = self.seat_var.get()
+        if seat != "任意":
+            first_v = plan.first_row.seats.get(seat, "--")
+            second_v = plan.second_row.seats.get(seat, "--")
+            score = 0
+            if is_candidate_ticket(first_v):
+                score += 1
+            if is_candidate_ticket(second_v):
+                score += 1
+            return score
+        best = 0
+        for seat_name in SEAT_OPTIONS:
+            if seat_name == "任意":
+                continue
+            first_v = plan.first_row.seats.get(seat_name, "--")
+            second_v = plan.second_row.seats.get(seat_name, "--")
+            score = 0
+            if is_candidate_ticket(first_v):
+                score += 1
+            if is_candidate_ticket(second_v):
+                score += 1
+            if score > best:
+                best = score
+        return best
+
     def _seat_value_score(self, value: str) -> int:
         text = (value or "").strip()
         if not text or text in {"--", "无", "*"}:
@@ -1191,6 +1305,7 @@ class App:
         if not plans:
             self.transfer_summary_var.set("未发现满足条件的中转方案")
             return
+        candidate_count = 0
         for plan in plans:
             values = (
                 plan.route.train_date,
@@ -1202,12 +1317,17 @@ class App:
                 self._format_minutes(plan.total_minutes),
                 plan.seat_hint,
             )
-            iid = self.transfer_tree.insert("", tk.END, values=values)
+            is_candidate = self._transfer_plan_candidate_score(plan) > 0
+            if is_candidate:
+                candidate_count += 1
+            tags = ("candidate",) if is_candidate else ()
+            iid = self.transfer_tree.insert("", tk.END, values=values, tags=tags)
             self.transfer_row_map[iid] = plan
-        self.transfer_summary_var.set(f"已生成 {len(plans)} 条中转方案")
+        self.transfer_summary_var.set(f"已生成 {len(plans)} 条中转方案（候补优先 {candidate_count} 条）")
 
-    def _collect_transfer_alerts(self, plans: List[TransferPlan]) -> List[str]:
+    def _collect_transfer_alerts(self, plans: List[TransferPlan]) -> Tuple[List[str], List[str]]:
         lines: List[str] = []
+        candidate_lines: List[str] = []
         for plan in plans:
             key = (
                 f"{plan.route.key()}:{plan.via_station}:{plan.first_row.train_no}:{plan.second_row.train_no}:"
@@ -1216,13 +1336,16 @@ class App:
             if key in self.alerted_keys:
                 continue
             self.alerted_keys.add(key)
-            lines.append(
+            text = (
                 "[中转] "
                 f"[{plan.route.train_date} {plan.route.from_station}->{plan.route.to_station}] "
                 f"经 {plan.via_station}：{plan.first_row.train_no}->{plan.second_row.train_no}，"
                 f"等待{plan.wait_minutes}分，{plan.seat_hint}"
             )
-        return lines
+            lines.append(text)
+            if self._transfer_plan_candidate_score(plan) > 0:
+                candidate_lines.append(f"[候补中转] {text}")
+        return lines, candidate_lines
 
     def _record_errors(self, errors: List[Tuple[str, str, str]]) -> None:
         for route_text, category, msg in errors:
@@ -1286,7 +1409,8 @@ class App:
                 row.seats.get("硬座", "--"),
                 row.seats.get("无座", "--"),
             )
-            item_id = self.result_tree.insert("", tk.END, values=values)
+            tags = ("candidate",) if self._display_row_candidate_score(item) > 0 else ()
+            item_id = self.result_tree.insert("", tk.END, values=values, tags=tags)
             self.result_row_map[item_id] = item
 
     def _collect_new_alerts(self, rows: List[DisplayRow]) -> Tuple[List[str], List[str]]:
