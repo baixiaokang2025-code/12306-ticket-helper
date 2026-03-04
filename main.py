@@ -648,18 +648,22 @@ class App:
         from_station = plan.route.from_station if is_first_leg else plan.via_station
         to_station = plan.via_station if is_first_leg else plan.route.to_station
         train_date = plan.route.train_date if is_first_leg else plan.second_depart_at.strftime("%Y-%m-%d")
+        train_no = plan.first_row.train_no if is_first_leg else plan.second_row.train_no
         try:
             url = self.client.build_left_ticket_url(
                 train_date=train_date,
                 from_station=from_station,
                 to_station=to_station,
+                train_no=train_no,
             )
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("打开失败", f"无法生成下单链接：{exc}")
             return
         webbrowser.open(url)
+        copied = self._copy_to_clipboard_silent(train_no)
         leg_text = "首段" if is_first_leg else "次段"
-        self.status_var.set(f"已打开{prefix}{leg_text}下单页（需你手动确认下单与支付）")
+        copy_text = f"，并复制车次 {train_no}" if copied else ""
+        self.status_var.set(f"已打开{prefix}{leg_text}下单页{copy_text}（需你手动确认下单与支付）")
 
     def open_selected_order_page(self) -> None:
         selected = self.result_tree.selection()
@@ -675,18 +679,22 @@ class App:
         self._open_display_row_order_page(display, prefix="选中线路")
 
     def _open_display_row_order_page(self, display: DisplayRow, *, prefix: str) -> None:
+        train_no = display.row.train_no
         try:
             url = self.client.build_left_ticket_url(
                 train_date=display.route.train_date,
                 from_station=display.route.from_station,
                 to_station=display.route.to_station,
+                train_no=train_no,
             )
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("打开失败", f"无法生成下单链接：{exc}")
             return
 
         webbrowser.open(url)
-        self.status_var.set(f"已打开{prefix}下单页（需你手动确认下单与支付）")
+        copied = self._copy_to_clipboard_silent(train_no)
+        copy_text = f"，并复制车次 {train_no}" if copied else ""
+        self.status_var.set(f"已打开{prefix}下单页{copy_text}（需你手动确认下单与支付）")
 
     def clear_cookie_text(self) -> None:
         self.cookie_var.set("")
@@ -904,6 +912,15 @@ class App:
             self.status_var.set("命中信息已复制到剪贴板，可直接粘贴给家人或同事协助抢票")
         except tk.TclError:
             pass
+
+    def _copy_to_clipboard_silent(self, text: str) -> bool:
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update_idletasks()
+            return True
+        except tk.TclError:
+            return False
 
     def _start_assist_countdown(self, seconds: int) -> None:
         self.assist_countdown_left = max(5, int(seconds))

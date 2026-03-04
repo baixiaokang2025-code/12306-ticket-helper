@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import random
 import time
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlencode
 
 import requests
 
@@ -235,14 +236,25 @@ class TicketQueryClient:
             )
         return rows
 
-    def build_left_ticket_url(self, train_date: str, from_station: str, to_station: str) -> str:
+    def build_left_ticket_url(
+        self,
+        train_date: str,
+        from_station: str,
+        to_station: str,
+        train_no: Optional[str] = None,
+    ) -> str:
         from_code = self.resolve_station_code(from_station)
         to_code = self.resolve_station_code(to_station)
-        # fs/ts uses "name,code" in official URL parameters.
-        return (
-            "https://kyfw.12306.cn/otn/leftTicket/init?"
-            f"linktypeid=dc&fs={from_station},{from_code}&ts={to_station},{to_code}&date={train_date}&flag=N,N,Y"
-        )
+        params = {
+            "linktypeid": "dc",
+            "fs": f"{from_station},{from_code}",
+            "ts": f"{to_station},{to_code}",
+            "date": train_date,
+            "flag": "N,N,Y",
+        }
+        if train_no:
+            params["train_no"] = train_no
+        return f"https://kyfw.12306.cn/otn/leftTicket/init?{urlencode(params)}"
 
     def check_login_status(self) -> Tuple[bool, str]:
         """
