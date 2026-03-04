@@ -5,7 +5,7 @@ cd /d %~dp0\..
 
 set APP_NAME=12306余票助手
 set VERSION_RAW=%~1
-if "%VERSION_RAW%"=="" set VERSION_RAW=v1.1.0
+if "%VERSION_RAW%"=="" set VERSION_RAW=v1.1.4
 set VERSION=%VERSION_RAW%
 if /I not "%VERSION:~0,1%"=="v" set VERSION=v%VERSION_RAW%
 set ZIP_NAME=12306-ticket-helper-windows-%VERSION%.zip

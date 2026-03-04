@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 APP_NAME="12306余票助手"
 
-VERSION_RAW="${1:-v1.1.0}"
+VERSION_RAW="${1:-v1.1.4}"
 if [[ "$VERSION_RAW" =~ ^v ]]; then
   VERSION_TAG="$VERSION_RAW"
 else

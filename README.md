@@ -56,25 +56,47 @@ python main.py
 ### macOS
 ```bash
 cd ~/Desktop/12306-ticket-helper
-bash scripts/build_macos.sh v1.1.2
+bash scripts/build_macos.sh v1.1.4
 ```
 产物：
 - `dist/12306余票助手.app`
-- `12306-ticket-helper-macos-v1.1.2.zip`
+- `12306-ticket-helper-macos-v1.1.4.zip`
 
 ### Windows
 在 `cmd` 或 `PowerShell` 中执行：
 ```bat
 cd %USERPROFILE%\Desktop\12306-ticket-helper
-scripts\build_windows.bat v1.1.2
+scripts\build_windows.bat v1.1.4
 ```
 产物：
 - `dist\12306余票助手\12306余票助手.exe`
-- `12306-ticket-helper-windows-v1.1.2.zip`
+- `12306-ticket-helper-windows-v1.1.4.zip`
 
-## Releases
-- 推送 tag（如 `v1.1.2`）后，GitHub Actions 会自动构建 Windows + macOS 包并上传到对应 Release。
-- 也可在 Actions 页手动触发 `Build Release Assets`，输入目标 tag 后执行。
+## 全流程发布（CI + Releases + Packages）
+1. 提交代码并推送 `main`：触发 CI（依赖安装 + `py_compile` 语法检查）。
+2. 打版本 tag（如 `v1.1.4`）并推送：触发跨平台打包。
+3. Actions 自动执行：
+   - 构建 `macOS` / `Windows` 安装包
+   - 上传到 GitHub Release
+   - 生成 `SHA256SUMS.txt` 校验文件
+   - 发布到 GitHub Container Registry（`/packages`）
+
+常用命令：
+```bash
+git add .
+git commit -m "chore: release v1.1.4"
+git push origin main
+git tag v1.1.4
+git push origin v1.1.4
+```
+
+## `/packages` 是什么
+- GitHub 的 `/packages` 页面展示的是该仓库发布到 `ghcr.io` 的容器包。
+- 本项目会发布 `12306-ticket-helper-assets`，镜像内包含本次 release 的 zip 安装包与 `SHA256SUMS.txt`。
+- 拉取示例：
+```bash
+docker pull ghcr.io/<你的用户名>/12306-ticket-helper-assets:v1.1.4
+```
 
 ## 目录
 - `main.py`：主界面与监控逻辑
@@ -82,3 +104,6 @@ scripts\build_windows.bat v1.1.2
 - `notifier.py`：邮件/企业微信通知
 - `app_config.py`：配置加载与保存
 - `scripts/`：macOS / Windows 打包脚本
+- `.github/workflows/ci.yml`：CI 语法检查
+- `.github/workflows/build-release-assets.yml`：构建、Release、Packages 全流程
+- `packages/release-assets/Dockerfile`：Packages 镜像构建模板
