@@ -80,7 +80,6 @@ class App:
         self.result_row_map: Dict[str, DisplayRow] = {}
         self.last_direct_recommend: Optional[DisplayRow] = None
         self.last_candidate_direct_recommend: Optional[DisplayRow] = None
-        self.error_stats: Dict[str, Dict[str, str]] = {}
 
         self.settings_path = Path(__file__).with_name("settings.json")
         self.settings = load_settings(self.settings_path)
@@ -246,21 +245,6 @@ class App:
         self.route_tree.configure(yscrollcommand=route_scroll.set)
         self.route_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
         route_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-        error_frame = ttk.LabelFrame(parent, text="错误分类面板", padding=8)
-        error_frame.pack(fill=tk.X, padx=4, pady=(0, 4))
-        ttk.Button(error_frame, text="清空统计", command=self.clear_error_stats).pack(anchor=tk.E, pady=(0, 4))
-        self.error_tree = ttk.Treeview(error_frame, columns=("category", "count", "last"), show="headings", height=4)
-        self.error_tree.heading("category", text="分类")
-        self.error_tree.heading("count", text="次数")
-        self.error_tree.heading("last", text="最近错误")
-        self.error_tree.column("category", width=110, anchor=tk.CENTER)
-        self.error_tree.column("count", width=80, anchor=tk.CENTER)
-        self.error_tree.column("last", width=900, anchor=tk.W)
-        err_scroll = ttk.Scrollbar(error_frame, orient=tk.VERTICAL, command=self.error_tree.yview)
-        self.error_tree.configure(yscrollcommand=err_scroll.set)
-        self.error_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        err_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         tip = ttk.Label(parent, text="说明：仅做余票查询/候补提醒与跳转，不自动下单。", padding=(8, 4, 8, 0))
         tip.pack(anchor=tk.W)
@@ -717,7 +701,6 @@ class App:
         if ticket_lines or candidate_lines:
             reminder_text = f" | 新提醒 有票{len(ticket_lines)} 候补{len(candidate_lines)}"
         if errors:
-            self._record_errors(errors)
             short_err = "；".join([f"{item[0]} {item[2]}" for item in errors[:2]])
             self.status_var.set(f"查询完成：{len(sorted_filtered)} 条（失败{len(errors)}条，{now}）{short_err}{reminder_text}")
         else:
@@ -863,32 +846,6 @@ class App:
             if is_candidate_ticket(value):
                 score += 1
         return score
-
-    def _record_errors(self, errors: List[Tuple[str, str, str]]) -> None:
-        for route_text, category, msg in errors:
-            key = category or "未知"
-            item = self.error_stats.get(key, {"count": "0", "last": ""})
-            count = int(item.get("count", "0")) + 1
-            item["count"] = str(count)
-            item["last"] = f"{route_text} {msg}"
-            self.error_stats[key] = item
-        self._render_error_stats()
-
-    def _render_error_stats(self) -> None:
-        for iid in self.error_tree.get_children():
-            self.error_tree.delete(iid)
-        for category in sorted(self.error_stats.keys()):
-            item = self.error_stats[category]
-            self.error_tree.insert(
-                "",
-                tk.END,
-                values=(category, item.get("count", "0"), item.get("last", "")),
-            )
-
-    def clear_error_stats(self) -> None:
-        self.error_stats = {}
-        self._render_error_stats()
-        self.status_var.set("已清空错误分类统计")
 
     def _apply_filters(self, rows: List[DisplayRow]) -> List[DisplayRow]:
         train_kw = self.train_filter_var.get().strip().upper()
