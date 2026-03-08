@@ -39,6 +39,7 @@ class WeComConfig:
 @dataclass
 class AppSettings:
     interval_sec: int = 5
+    fast_query_mode: bool = True
     train_filter: str = ""
     seat_filter: str = "任意"
     routes: List[RouteItem] = field(default_factory=list)
@@ -127,6 +128,7 @@ def load_settings(path: Path) -> AppSettings:
 
     return AppSettings(
         interval_sec=max(2, _to_int(data.get("interval_sec"), 5)),
+        fast_query_mode=_to_bool(data.get("fast_query_mode"), True),
         train_filter=str(data.get("train_filter", "")),
         seat_filter=str(data.get("seat_filter", "任意")),
         routes=routes,

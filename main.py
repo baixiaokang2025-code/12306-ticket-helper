@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import random
 import re
 import threading
 import tkinter as tk
@@ -8,7 +7,6 @@ import webbrowser
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-import time
 from tkinter import messagebox, ttk
 from typing import Dict, List, Optional, Tuple
 
@@ -93,6 +91,7 @@ class App:
         self.batch_group_var = tk.StringVar(value="默认")
 
         self.interval_var = tk.IntVar(value=max(2, self.settings.interval_sec))
+        self.fast_query_mode_var = tk.BooleanVar(value=self.settings.fast_query_mode)
         self.train_filter_var = tk.StringVar(value=self.settings.train_filter)
         self.seat_var = tk.StringVar(value=self.settings.seat_filter if self.settings.seat_filter in SEAT_OPTIONS else "任意")
         self.retry_attempts_var = tk.IntVar(value=max(1, self.settings.retry_attempts))
@@ -149,18 +148,19 @@ class App:
 
         ttk.Label(ctrl, text="刷新间隔(秒)").grid(row=0, column=0, sticky=tk.W, padx=(0, 4), pady=4)
         ttk.Spinbox(ctrl, from_=2, to=600, textvariable=self.interval_var, width=8).grid(row=0, column=1, pady=4)
+        ttk.Checkbutton(ctrl, text="极速查询", variable=self.fast_query_mode_var).grid(row=0, column=2, sticky=tk.W, padx=(14, 4), pady=4)
 
-        ttk.Label(ctrl, text="车次过滤").grid(row=0, column=2, sticky=tk.W, padx=(14, 4), pady=4)
-        ttk.Entry(ctrl, textvariable=self.train_filter_var, width=14).grid(row=0, column=3, pady=4)
+        ttk.Label(ctrl, text="车次过滤").grid(row=0, column=3, sticky=tk.W, padx=(14, 4), pady=4)
+        ttk.Entry(ctrl, textvariable=self.train_filter_var, width=14).grid(row=0, column=4, pady=4)
 
-        ttk.Label(ctrl, text="提醒座位").grid(row=0, column=4, sticky=tk.W, padx=(14, 4), pady=4)
+        ttk.Label(ctrl, text="提醒座位").grid(row=0, column=5, sticky=tk.W, padx=(14, 4), pady=4)
         ttk.Combobox(ctrl, textvariable=self.seat_var, values=SEAT_OPTIONS, width=10, state="readonly").grid(
-            row=0, column=5, pady=4
+            row=0, column=6, pady=4
         )
-        ttk.Label(ctrl, text="指定车次").grid(row=0, column=6, sticky=tk.W, padx=(14, 4), pady=4)
-        ttk.Entry(ctrl, textvariable=self.quick_train_no_var, width=10).grid(row=0, column=7, pady=4, sticky=tk.W)
+        ttk.Label(ctrl, text="指定车次").grid(row=0, column=7, sticky=tk.W, padx=(14, 4), pady=4)
+        ttk.Entry(ctrl, textvariable=self.quick_train_no_var, width=10).grid(row=0, column=8, pady=4, sticky=tk.W)
         ttk.Button(ctrl, text="按车次打开下单页", command=self.open_order_page_by_train_no).grid(
-            row=0, column=8, columnspan=2, padx=(8, 0), pady=4, sticky=tk.W
+            row=0, column=9, columnspan=2, padx=(8, 0), pady=4, sticky=tk.W
         )
 
         ttk.Label(ctrl, text="重试次数").grid(row=1, column=0, sticky=tk.W, padx=(0, 4), pady=4)
@@ -191,7 +191,7 @@ class App:
         )
 
         btns = ttk.Frame(ctrl)
-        btns.grid(row=0, column=10, rowspan=3, padx=(16, 0), sticky=tk.E)
+        btns.grid(row=0, column=11, rowspan=3, padx=(16, 0), sticky=tk.E)
         self.query_btn = ttk.Button(btns, text="立即查询", command=self.trigger_query)
         self.query_btn.pack(side=tk.LEFT, padx=3)
         self.start_btn = ttk.Button(btns, text="开始监控", command=self.start_monitor)
@@ -692,7 +692,7 @@ class App:
         policy = self._build_retry_policy()
         query_cache: Dict[Tuple[str, str, str], List[TicketRow]] = {}
 
-        for index, route in enumerate(routes):
+        for route in routes:
             route_text = f"[{route.group}] {route.train_date} {route.from_station}->{route.to_station}"
             route_rows = self._query_route_rows_with_cache(
                 train_date=route.train_date,
@@ -704,8 +704,6 @@ class App:
                 errors=errors,
             )
             rows.extend([DisplayRow(route=route, row=item) for item in route_rows])
-            if index < len(routes) - 1:
-                time.sleep(random.uniform(0.4, 1.0))
 
         self.root.after(0, lambda: self.on_query_done(rows, errors))
 
@@ -833,6 +831,8 @@ class App:
         base_delay = max(0.1, float(self.retry_base_delay_var.get()))
         max_delay = max(base_delay, float(self.retry_max_delay_var.get()))
         timeout_sec = max(2.0, float(self.request_timeout_var.get()))
+        if self.fast_query_mode_var.get():
+            return RetryPolicy(attempts=1, base_delay_sec=0.1, max_delay_sec=0.2, timeout_sec=min(timeout_sec, 6.0))
         return RetryPolicy(
             attempts=attempts,
             base_delay_sec=base_delay,
@@ -1044,6 +1044,7 @@ class App:
     def _collect_settings(self) -> AppSettings:
         return AppSettings(
             interval_sec=max(2, int(self.interval_var.get())),
+            fast_query_mode=self.fast_query_mode_var.get(),
             train_filter=self.train_filter_var.get().strip(),
             seat_filter=self.seat_var.get().strip(),
             routes=list(self.routes),
