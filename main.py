@@ -99,6 +99,7 @@ class App:
         self.retry_base_delay_var = tk.DoubleVar(value=max(0.1, self.settings.retry_base_delay_sec))
         self.retry_max_delay_var = tk.DoubleVar(value=max(0.2, self.settings.retry_max_delay_sec))
         self.request_timeout_var = tk.DoubleVar(value=max(2.0, self.settings.request_timeout_sec))
+        self.quick_train_no_var = tk.StringVar(value="")
         self.assist_countdown_sec_var = tk.IntVar(value=max(5, self.settings.assist_countdown_sec))
         self.copy_alert_var = tk.BooleanVar(value=self.settings.copy_alert_to_clipboard)
         self.assist_countdown_text_var = tk.StringVar(value="抢票指引：等待命中后自动提示")
@@ -155,6 +156,11 @@ class App:
         ttk.Label(ctrl, text="提醒座位").grid(row=0, column=4, sticky=tk.W, padx=(14, 4), pady=4)
         ttk.Combobox(ctrl, textvariable=self.seat_var, values=SEAT_OPTIONS, width=10, state="readonly").grid(
             row=0, column=5, pady=4
+        )
+        ttk.Label(ctrl, text="指定车次").grid(row=0, column=6, sticky=tk.W, padx=(14, 4), pady=4)
+        ttk.Entry(ctrl, textvariable=self.quick_train_no_var, width=10).grid(row=0, column=7, pady=4, sticky=tk.W)
+        ttk.Button(ctrl, text="按车次打开下单页", command=self.open_order_page_by_train_no).grid(
+            row=0, column=8, columnspan=2, padx=(8, 0), pady=4, sticky=tk.W
         )
 
         ttk.Label(ctrl, text="重试次数").grid(row=1, column=0, sticky=tk.W, padx=(0, 4), pady=4)
@@ -518,6 +524,49 @@ class App:
             messagebox.showwarning("提示", "未找到选中记录，请重新查询后再试")
             return
         self._open_display_row_order_page(display, prefix="选中线路")
+
+    def open_order_page_by_train_no(self) -> None:
+        train_no = self.quick_train_no_var.get().strip().upper()
+        if not train_no:
+            messagebox.showwarning("提示", "请先输入车次（例如 G123）")
+            return
+
+        for display in self.result_row_map.values():
+            if display.row.train_no.upper() == train_no:
+                self._open_display_row_order_page(display, prefix=f"指定车次 {train_no}")
+                return
+
+        route = self._resolve_route_for_train_open()
+        if not route:
+            messagebox.showwarning("提示", "未找到可用线路，请先添加线路或先查询一次")
+            return
+        try:
+            url = self.client.build_left_ticket_url(
+                train_date=route.train_date,
+                from_station=route.from_station,
+                to_station=route.to_station,
+                train_no=train_no,
+            )
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("打开失败", f"无法生成下单链接：{exc}")
+            return
+
+        webbrowser.open(url)
+        copied = self._copy_to_clipboard_silent(train_no)
+        copy_text = f"，并复制车次 {train_no}" if copied else ""
+        self.status_var.set(f"已打开指定车次下单页{copy_text}（需你手动确认下单与支付）")
+
+    def _resolve_route_for_train_open(self) -> Optional[RouteItem]:
+        selected = self.route_tree.selection()
+        if selected:
+            selected_key = selected[0]
+            for route in self.routes:
+                if route.key() == selected_key:
+                    return route
+        routes = self._get_routes_for_query()
+        if routes:
+            return routes[0]
+        return None
 
     def _open_display_row_order_page(self, display: DisplayRow, *, prefix: str) -> None:
         train_no = display.row.train_no
